@@ -9,7 +9,9 @@ import shutil
 import subprocess
 import tempfile
 import zipfile
+from xml.etree import ElementTree
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Literal
 
@@ -26,7 +28,7 @@ from .models import (
     Attachment,
     GeneratedArtifact,
     KnowledgeBaseAccess,
-    OrganizationBrandKit,
+    OrganizationDocumentTemplateVersion,
     utc_now,
 )
 from .observability import exception_stack, get_logger, log_event
@@ -41,7 +43,13 @@ MIME_TYPES = {
     "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
 }
 FORMAT_SUFFIXES = {"docx": ".docx", "pptx": ".pptx"}
-CURATED_FONTS = {"Aptos", "Aptos Display", "Arial", "Calibri", "Georgia", "Times New Roman"}
+DEFAULT_ARTIFACT_THEME = {
+    "primary_color": "#312E81",
+    "accent_color": "#6D28D9",
+    "heading_font": "Aptos Display",
+    "body_font": "Aptos",
+    "footer_text": "Jules AI",
+}
 
 
 class ArtifactBlock(BaseModel):
@@ -283,95 +291,120 @@ def _hex(value: str, fallback: str) -> str:
     return cleaned if re.fullmatch(r"[0-9A-F]{6}", cleaned) else fallback
 
 
-def render_docx(spec: ArtifactSpec, destination: Path, brand: dict[str, Any], citations: list[dict[str, Any]]) -> None:
+def render_docx(
+    spec: ArtifactSpec,
+    destination: Path,
+    citations: list[dict[str, Any]],
+    template_bytes: bytes | None = None,
+) -> None:
     from docx import Document
-    from docx.enum.section import WD_SECTION
-    from docx.enum.style import WD_STYLE_TYPE
     from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT
     from docx.enum.text import WD_ALIGN_PARAGRAPH
     from docx.oxml import OxmlElement
     from docx.oxml.ns import qn
     from docx.shared import Inches, Pt, RGBColor
 
-    primary = _hex(str(brand.get("primary_color", "")), "4C1D95")
-    accent = _hex(str(brand.get("accent_color", "")), "7C3AED")
-    heading_font = brand.get("heading_font") if brand.get("heading_font") in CURATED_FONTS else "Aptos Display"
-    body_font = brand.get("body_font") if brand.get("body_font") in CURATED_FONTS else "Aptos"
-    doc = Document()
+    primary = _hex(DEFAULT_ARTIFACT_THEME["primary_color"], "312E81")
+    accent = _hex(DEFAULT_ARTIFACT_THEME["accent_color"], "6D28D9")
+    heading_font = DEFAULT_ARTIFACT_THEME["heading_font"]
+    body_font = DEFAULT_ARTIFACT_THEME["body_font"]
+    using_template = template_bytes is not None
+    doc = Document(BytesIO(template_bytes)) if template_bytes else Document()
+    if using_template:
+        body = doc._element.body
+        for child in list(body):
+            if child.tag != qn("w:sectPr"):
+                body.remove(child)
     section = doc.sections[0]
-    section.top_margin = Inches(0.85)
-    section.bottom_margin = Inches(0.8)
-    section.left_margin = Inches(0.9)
-    section.right_margin = Inches(0.9)
-    section.header_distance = Inches(0.4)
-    section.footer_distance = Inches(0.4)
+    if not using_template:
+        section.top_margin = Inches(0.85)
+        section.bottom_margin = Inches(0.8)
+        section.left_margin = Inches(0.9)
+        section.right_margin = Inches(0.9)
+        section.header_distance = Inches(0.4)
+        section.footer_distance = Inches(0.4)
 
-    normal = doc.styles["Normal"]
-    normal.font.name = body_font
-    normal.font.size = Pt(10.5)
-    normal.paragraph_format.space_after = Pt(6)
-    normal.paragraph_format.line_spacing = 1.12
-    for name, size in (("Title", 30), ("Subtitle", 13), ("Heading 1", 18), ("Heading 2", 14), ("Heading 3", 11.5)):
-        style = doc.styles[name]
-        style.font.name = heading_font
-        style.font.size = Pt(size)
-        style.font.color.rgb = RGBColor.from_string(primary)
-        style.paragraph_format.space_before = Pt(12 if name.startswith("Heading") else 0)
-        style.paragraph_format.space_after = Pt(7)
-        style.paragraph_format.keep_with_next = True
+        normal = doc.styles["Normal"]
+        normal.font.name = body_font
+        normal.font.size = Pt(10.5)
+        normal.paragraph_format.space_after = Pt(6)
+        normal.paragraph_format.line_spacing = 1.12
+        for name, size in (("Title", 30), ("Subtitle", 13), ("Heading 1", 18), ("Heading 2", 14), ("Heading 3", 11.5)):
+            style = doc.styles[name]
+            style.font.name = heading_font
+            style.font.size = Pt(size)
+            style.font.color.rgb = RGBColor.from_string(primary)
+            style.paragraph_format.space_before = Pt(12 if name.startswith("Heading") else 0)
+            style.paragraph_format.space_after = Pt(7)
 
-    footer = section.footer.paragraphs[0]
-    footer.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-    footer_run = footer.add_run((brand.get("footer_text") or "Jules AI") + "  |  ")
-    footer_run.font.name = body_font
-    footer_run.font.size = Pt(8)
-    footer_run.font.color.rgb = RGBColor(100, 100, 110)
-    field = OxmlElement("w:fldSimple")
-    field.set(qn("w:instr"), "PAGE")
-    footer._p.append(field)
+        footer = section.footer.paragraphs[0]
+        footer.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+        footer_run = footer.add_run(DEFAULT_ARTIFACT_THEME["footer_text"] + "  |  ")
+        footer_run.font.name = body_font
+        footer_run.font.size = Pt(8)
+        footer_run.font.color.rgb = RGBColor(100, 100, 110)
+        field = OxmlElement("w:fldSimple")
+        field.set(qn("w:instr"), "PAGE")
+        footer._p.append(field)
 
-    logo_path = brand.get("logo_path")
-    if logo_path and Path(logo_path).exists():
-        p = doc.add_paragraph()
-        p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-        p.add_run().add_picture(str(logo_path), width=Inches(1.25))
-    title = doc.add_paragraph(style="Title")
+    style_names = {style.name for style in doc.styles}
+
+    def add_styled_paragraph(text: str = "", style_name: str | None = None):
+        paragraph = doc.add_paragraph(style=style_name if style_name in style_names else None)
+        if text:
+            paragraph.add_run(text)
+        widow = OxmlElement("w:widowControl")
+        paragraph._p.get_or_add_pPr().append(widow)
+        return paragraph
+
+    def add_heading(text: str, level: int):
+        paragraph = add_styled_paragraph(text, f"Heading {level}")
+        paragraph.paragraph_format.keep_with_next = True
+        return paragraph
+
+    title = add_styled_paragraph(style_name="Title")
     title.add_run(spec.title)
+    title.paragraph_format.keep_with_next = True
     if spec.subtitle:
-        subtitle = doc.add_paragraph(style="Subtitle")
+        subtitle = add_styled_paragraph(style_name="Subtitle")
         subtitle.add_run(spec.subtitle)
-    rule = doc.add_paragraph()
-    rule.paragraph_format.space_after = Pt(16)
-    p_pr = rule._p.get_or_add_pPr()
-    borders = OxmlElement("w:pBdr")
-    bottom = OxmlElement("w:bottom")
-    bottom.set(qn("w:val"), "single")
-    bottom.set(qn("w:sz"), "16")
-    bottom.set(qn("w:color"), accent)
-    borders.append(bottom)
-    p_pr.append(borders)
+    if not using_template:
+        rule = add_styled_paragraph()
+        rule.paragraph_format.space_after = Pt(16)
+        p_pr = rule._p.get_or_add_pPr()
+        borders = OxmlElement("w:pBdr")
+        bottom = OxmlElement("w:bottom")
+        bottom.set(qn("w:val"), "single")
+        bottom.set(qn("w:sz"), "16")
+        bottom.set(qn("w:color"), accent)
+        borders.append(bottom)
+        p_pr.append(borders)
 
-    for page_index, page in enumerate(spec.pages):
-        if page_index:
-            doc.add_page_break()
-        doc.add_heading(page.title, level=1)
+    page_width = section.page_width or Inches(8.5)
+    left_margin = section.left_margin or Inches(1)
+    right_margin = section.right_margin or Inches(1)
+    table_width_dxa = max(1440, int((page_width - left_margin - right_margin) / 635))
+
+    for page in spec.pages:
+        add_heading(page.title, 1)
         if page.subtitle:
-            p = doc.add_paragraph(page.subtitle)
+            p = add_styled_paragraph(page.subtitle)
             p.runs[0].italic = True
-            p.runs[0].font.color.rgb = RGBColor(90, 90, 100)
+            if not using_template:
+                p.runs[0].font.color.rgb = RGBColor(90, 90, 100)
         for block in page.blocks:
             if block.heading:
-                doc.add_heading(block.heading, level=2)
+                add_heading(block.heading, 2)
             if block.kind in {"bullets", "numbered"}:
                 style_name = "List Bullet" if block.kind == "bullets" else "List Number"
                 for item in block.items[:20]:
-                    doc.add_paragraph(item, style=style_name)
+                    add_styled_paragraph(item, style_name)
             elif block.kind == "table" and block.headers:
                 width = len(block.headers)
                 table = doc.add_table(rows=1, cols=width)
-                table.style = "Table Grid"
+                if "Table Grid" in style_names:
+                    table.style = "Table Grid"
                 table.autofit = False
-                table_width_dxa = 9648
                 widths = [table_width_dxa // width] * width
                 table_properties = table._tbl.tblPr
                 table_width = table_properties.find(qn("w:tblW"))
@@ -384,12 +417,14 @@ def render_docx(spec: ArtifactSpec, destination: Path, brand: dict[str, Any], ci
                     cell = table.rows[0].cells[col_index]
                     cell.text = value
                     cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
-                    shading = OxmlElement("w:shd")
-                    shading.set(qn("w:fill"), primary)
-                    cell._tc.get_or_add_tcPr().append(shading)
+                    if not using_template:
+                        shading = OxmlElement("w:shd")
+                        shading.set(qn("w:fill"), primary)
+                        cell._tc.get_or_add_tcPr().append(shading)
                     for run in cell.paragraphs[0].runs:
                         run.bold = True
-                        run.font.color.rgb = RGBColor(255, 255, 255)
+                        if not using_template:
+                            run.font.color.rgb = RGBColor(255, 255, 255)
                 for raw_row in block.rows[:30]:
                     cells = table.add_row().cells
                     for col_index in range(width):
@@ -403,28 +438,28 @@ def render_docx(spec: ArtifactSpec, destination: Path, brand: dict[str, Any], ci
                             cell._tc.get_or_add_tcPr().append(tc_width)
                         tc_width.set(qn("w:type"), "dxa")
                         tc_width.set(qn("w:w"), str(widths[index]))
-                doc.add_paragraph()
+                add_styled_paragraph()
             elif block.kind == "callout":
                 table = doc.add_table(rows=1, cols=1)
                 table.autofit = False
                 cell = table.cell(0, 0)
                 cell.text = block.text
-                shading = OxmlElement("w:shd")
-                shading.set(qn("w:fill"), "F4F1FA")
-                cell._tc.get_or_add_tcPr().append(shading)
-                doc.add_paragraph()
+                if not using_template:
+                    shading = OxmlElement("w:shd")
+                    shading.set(qn("w:fill"), "F4F1FA")
+                    cell._tc.get_or_add_tcPr().append(shading)
+                add_styled_paragraph()
             elif block.text:
-                doc.add_paragraph(block.text)
+                add_styled_paragraph(block.text)
 
     if citations:
-        doc.add_page_break()
-        doc.add_heading("Sources", level=1)
+        add_heading("Sources", 1)
         for citation in citations:
             label = f"[{citation['ordinal']}] {citation['title']}"
             details = citation.get("location") or citation.get("url") or ""
             if citation.get("publisher"):
                 details = f"{citation['publisher']} - {details}"
-            doc.add_paragraph(f"{label}. {details}".strip())
+            add_styled_paragraph(f"{label}. {details}".strip())
     doc.save(destination)
 
 
@@ -432,7 +467,7 @@ def _run(command: list[str], timeout: int | None = None) -> subprocess.Completed
     return subprocess.run(command, check=True, capture_output=True, text=True, timeout=timeout or settings.artifact_render_timeout_seconds)
 
 
-def render_pptx(spec: ArtifactSpec, destination: Path, brand: dict[str, Any], citations: list[dict[str, Any]], work_dir: Path) -> None:
+def render_pptx(spec: ArtifactSpec, destination: Path, theme: dict[str, Any], citations: list[dict[str, Any]], work_dir: Path) -> None:
     candidates = (
         Path.cwd() / "artifact-renderer" / "render-pptx.mjs",
         Path.cwd().parent / "artifact-renderer" / "render-pptx.mjs",
@@ -442,12 +477,12 @@ def render_pptx(spec: ArtifactSpec, destination: Path, brand: dict[str, Any], ci
     if not renderer.exists():
         raise RuntimeError("The PowerPoint renderer is not installed")
     spec_path = work_dir / "spec.json"
-    brand_path = work_dir / "brand.json"
+    theme_path = work_dir / "theme.json"
     citations_path = work_dir / "citations.json"
     spec_path.write_text(spec.model_dump_json(), encoding="utf-8")
-    brand_path.write_text(json.dumps(brand), encoding="utf-8")
+    theme_path.write_text(json.dumps(theme), encoding="utf-8")
     citations_path.write_text(json.dumps(citations), encoding="utf-8")
-    _run(["node", str(renderer), str(spec_path), str(brand_path), str(citations_path), str(destination)])
+    _run(["node", str(renderer), str(spec_path), str(theme_path), str(citations_path), str(destination)])
 
 
 def structural_qa(path: Path, format_name: str, expected_count: int) -> dict[str, Any]:
@@ -460,13 +495,52 @@ def structural_qa(path: Path, format_name: str, expected_count: int) -> dict[str
     if format_name == "docx":
         if "word/document.xml" not in names:
             raise RuntimeError("Generated Word document is missing its body")
+        with zipfile.ZipFile(path) as archive:
+            document_root = ElementTree.fromstring(archive.read("word/document.xml"))
+        word_namespace = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+        manual_page_breaks = sum(
+            1 for item in document_root.iter(f"{word_namespace}br")
+            if item.attrib.get(f"{word_namespace}type") == "page"
+        )
+        if manual_page_breaks:
+            raise RuntimeError("Generated Word document contains unexplained manual page breaks")
         page_count = None
     else:
         slide_count = len([name for name in names if re.fullmatch(r"ppt/slides/slide\d+\.xml", name)])
         if slide_count < expected_count:
             raise RuntimeError("Generated presentation is missing slides")
         page_count = slide_count
-    return {"structural": "passed", "output_bytes": path.stat().st_size, "structural_page_count": page_count}
+    return {
+        "structural": "passed",
+        "output_bytes": path.stat().st_size,
+        "structural_page_count": page_count,
+        "manual_page_breaks": 0 if format_name == "docx" else None,
+    }
+
+
+def preview_layout_qa(preview_paths: list[Path]) -> dict[str, Any]:
+    if not preview_paths:
+        return {"status": "unavailable", "blank_pages": [], "nearly_empty_pages": []}
+    from PIL import Image, ImageStat
+
+    blank_pages: list[int] = []
+    nearly_empty_pages: list[int] = []
+    ink_ratios: list[float] = []
+    for index, preview_path in enumerate(preview_paths, start=1):
+        with Image.open(preview_path) as image:
+            grayscale = image.convert("L")
+            histogram = ImageStat.Stat(grayscale).sum[0]
+            maximum = 255 * grayscale.width * grayscale.height
+            ink_ratio = max(0.0, min(1.0, (maximum - histogram) / maximum))
+        ink_ratios.append(round(ink_ratio, 5))
+        if ink_ratio < 0.0008:
+            blank_pages.append(index)
+        elif index > 1 and ink_ratio < 0.002:
+            nearly_empty_pages.append(index)
+    if blank_pages or nearly_empty_pages:
+        pages = sorted(set(blank_pages + nearly_empty_pages))
+        raise RuntimeError("Generated document contains blank or nearly empty pages: " + ", ".join(map(str, pages)))
+    return {"status": "passed", "blank_pages": [], "nearly_empty_pages": [], "ink_ratios": ink_ratios}
 
 
 def render_previews(path: Path, output_dir: Path) -> list[Path]:
@@ -623,21 +697,14 @@ async def process_artifact_job(db: AsyncSession, storage: StorageService, job: A
     version.content_spec_json = result.spec.model_dump_json()
     await db.commit()
 
-    brand_row = await db.scalar(select(OrganizationBrandKit).where(OrganizationBrandKit.organization_id == artifact.organization_id)) if artifact.use_brand_kit else None
-    brand: dict[str, Any] = {
-        "primary_color": brand_row.primary_color if brand_row else "#4C1D95",
-        "accent_color": brand_row.accent_color if brand_row else "#7C3AED",
-        "heading_font": brand_row.heading_font if brand_row else "Aptos Display",
-        "body_font": brand_row.body_font if brand_row else "Aptos",
-        "footer_text": brand_row.footer_text if brand_row else "Jules AI",
-    }
+    document_template_bytes: bytes | None = None
+    if artifact.format == "docx" and version.document_template_version_id:
+        template_version = await db.get(OrganizationDocumentTemplateVersion, version.document_template_version_id)
+        if not template_version or template_version.organization_id != artifact.organization_id or template_version.status != "ready":
+            raise RuntimeError("The document template selected for this version is unavailable")
+        document_template_bytes = await storage.read(template_version.storage_key)
     with tempfile.TemporaryDirectory(prefix="jules-artifact-") as temp_name:
         work_dir = Path(temp_name)
-        if brand_row and brand_row.logo_storage_key:
-            logo_suffix = Path(brand_row.logo_file_name or "logo.png").suffix or ".png"
-            logo_path = work_dir / f"logo{logo_suffix}"
-            logo_path.write_bytes(await storage.read(brand_row.logo_storage_key))
-            brand["logo_path"] = str(logo_path)
         safe_stem = re.sub(r"[^a-zA-Z0-9_-]+", "-", artifact.title).strip("-")[:80] or "jules-artifact"
         file_name = f"{safe_stem}-v{version.version_number}{FORMAT_SUFFIXES[artifact.format]}"
         output_path = work_dir / file_name
@@ -651,9 +718,9 @@ async def process_artifact_job(db: AsyncSession, storage: StorageService, job: A
             if preview_dir.exists():
                 shutil.rmtree(preview_dir)
             if artifact.format == "docx":
-                await asyncio.to_thread(render_docx, result.spec, output_path, brand, citation_dicts)
+                await asyncio.to_thread(render_docx, result.spec, output_path, citation_dicts, document_template_bytes)
             else:
-                await asyncio.to_thread(render_pptx, result.spec, output_path, brand, citation_dicts, work_dir)
+                await asyncio.to_thread(render_pptx, result.spec, output_path, DEFAULT_ARTIFACT_THEME, citation_dicts, work_dir)
             qa = await asyncio.to_thread(structural_qa, output_path, artifact.format, len(result.spec.pages))
             if output_path.stat().st_size > settings.artifact_max_bytes:
                 raise RuntimeError("Generated file exceeds the configured 50 MB limit")
@@ -662,6 +729,8 @@ async def process_artifact_job(db: AsyncSession, storage: StorageService, job: A
             await db.commit()
             await _check_cancelled(db, job, artifact, version)
             preview_paths = await asyncio.to_thread(render_previews, output_path, preview_dir)
+            if artifact.format == "docx":
+                qa["layout"] = await asyncio.to_thread(preview_layout_qa, preview_paths)
             visual_result = await visual_qa(str(scope.get("model") or settings.gemini_model), preview_paths)
             if visual_result.passed:
                 break
@@ -711,7 +780,7 @@ async def process_artifact_job(db: AsyncSession, storage: StorageService, job: A
     job.progress = 100
     job.completed_at = utc_now()
     await db.commit()
-    log_event(logger, logging.INFO, "artifact.generation_completed", artifact_id=artifact.id, version_id=version.id, format=artifact.format, page_count=page_count, size_bytes=len(data), source_count=len(citation_dicts))
+    log_event(logger, logging.INFO, "artifact.generation_completed", artifact_id=artifact.id, version_id=version.id, format=artifact.format, page_count=page_count, size_bytes=len(data), source_count=len(citation_dicts), document_template_version_id=version.document_template_version_id)
 
 
 async def delete_artifact_files(db: AsyncSession, storage: StorageService, artifact_id: str) -> None:

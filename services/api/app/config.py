@@ -36,6 +36,7 @@ class Settings(BaseSettings):
     artifact_max_bytes: int = 50 * 1024 * 1024
     artifact_qa_retry_count: int = 2
     artifact_render_timeout_seconds: int = 120
+    document_template_max_bytes: int = 15 * 1024 * 1024
 
     @property
     def allowed_origins(self) -> list[str]:

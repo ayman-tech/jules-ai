@@ -111,6 +111,11 @@ class GcsStorageService(StorageService):
         try:
             self.bucket.blob(key).delete(if_generation_match=None)
         except Exception as exc:
+            from google.api_core.exceptions import NotFound
+
+            if isinstance(exc, NotFound):
+                log_event(logger, logging.INFO, "storage.operation_completed", provider="gcs", operation="delete", key=key, already_missing=True, duration_ms=round((perf_counter() - started) * 1000, 2))
+                return
             log_event(logger, logging.ERROR, "storage.operation_failed", provider="gcs", operation="delete", key=key, error_type=type(exc).__name__, stack=exception_stack(exc))
             raise
         log_event(logger, logging.INFO, "storage.operation_completed", provider="gcs", operation="delete", key=key, duration_ms=round((perf_counter() - started) * 1000, 2))

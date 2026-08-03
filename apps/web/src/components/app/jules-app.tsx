@@ -13,7 +13,7 @@ import { PromptLibrary } from "@/components/app/prompt-library"
 import { SettingsView } from "@/components/app/settings-view"
 import { julesApi } from "@/lib/api"
 import { demoAuditEvents, demoConversations, demoInvitations, demoKnowledgeBases, demoKnowledgeReview, demoMembers, demoMessages, demoModels, demoOrganizations, demoPrompts, demoSettings, demoUser } from "@/lib/demo-data"
-import type { Artifact, ArtifactRequest, Attachment, Citation, Conversation, Effort, Invitation, KnowledgeBase, Message, Organization, OrganizationBrandKit, Prompt, PromptVersion, UserSettings, View } from "@/lib/types"
+import type { Artifact, ArtifactRequest, Attachment, Citation, Conversation, DocumentTemplateVersion, Effort, Invitation, KnowledgeBase, Message, Organization, OrganizationDocumentTemplate, Prompt, PromptVersion, UserSettings, View } from "@/lib/types"
 
 const FALLBACK_RESPONSE = "I’ve organized the request into a practical business answer.\n\n### Recommended approach\n\n1. **Clarify the decision.** State the outcome, owner, and time horizon.\n2. **Prioritize the evidence.** Lead with the facts that materially change the decision.\n3. **Make the next move explicit.** End with an accountable action and measurable checkpoint."
 
@@ -37,7 +37,7 @@ export function JulesApp(props: JulesAppProps = {}) {
   const [messages, setMessages] = useState<Record<string, Message[]>>(demoMessages)
   const [prompts, setPrompts] = useState(demoPrompts)
   const [settings, setSettings] = useState(demoSettings)
-  const [brandKit, setBrandKit] = useState<OrganizationBrandKit>({ primary_color: "#4C1D95", accent_color: "#7C3AED", heading_font: "Aptos Display", body_font: "Aptos", footer_text: "", has_logo: false, can_manage: false, available_fonts: ["Aptos", "Aptos Display", "Arial", "Calibri", "Georgia", "Times New Roman"] })
+  const [documentTemplate, setDocumentTemplate] = useState<OrganizationDocumentTemplate>({ enabled: false, active_version: null, pending_version: null, versions: [], can_manage: false })
   const [models, setModels] = useState(demoModels)
   const [members, setMembers] = useState(demoMembers)
   const [invitations, setInvitations] = useState(demoInvitations)
@@ -63,11 +63,11 @@ export function JulesApp(props: JulesAppProps = {}) {
   useEffect(() => {
     let cancelled = false
     Promise.all([
-      julesApi.organizations(), julesApi.me(activeOrganizationId), julesApi.conversations(activeOrganizationId), julesApi.prompts(activeOrganizationId), julesApi.settings(activeOrganizationId), julesApi.models(activeOrganizationId), julesApi.members(activeOrganizationId), julesApi.invitations(activeOrganizationId).catch(() => []), julesApi.auditEvents(activeOrganizationId).catch(() => []), julesApi.knowledgeBases(activeOrganizationId), julesApi.knowledgeReview(activeOrganizationId).catch(() => demoKnowledgeReview), julesApi.brandKit(activeOrganizationId),
-    ]).then(([nextOrganizations, profile, nextConversations, nextPrompts, nextSettings, modelPolicy, nextMembers, nextInvitations, nextAudit, nextKnowledgeBases, nextReview, nextBrandKit]) => {
+      julesApi.organizations(), julesApi.me(activeOrganizationId), julesApi.conversations(activeOrganizationId), julesApi.prompts(activeOrganizationId), julesApi.settings(activeOrganizationId), julesApi.models(activeOrganizationId), julesApi.members(activeOrganizationId), julesApi.invitations(activeOrganizationId).catch(() => []), julesApi.auditEvents(activeOrganizationId).catch(() => []), julesApi.knowledgeBases(activeOrganizationId), julesApi.knowledgeReview(activeOrganizationId).catch(() => demoKnowledgeReview), julesApi.documentTemplate(activeOrganizationId),
+    ]).then(([nextOrganizations, profile, nextConversations, nextPrompts, nextSettings, modelPolicy, nextMembers, nextInvitations, nextAudit, nextKnowledgeBases, nextReview, nextDocumentTemplate]) => {
       if (cancelled) return
       backendConnected.current = true
-      setOrganizations(nextOrganizations); setUser(profile); setConversations(nextConversations); setPrompts(nextPrompts); setSettings(nextSettings); setModels(modelPolicy.models); setMembers(nextMembers); setInvitations(nextInvitations); setAuditEvents(nextAudit); setKnowledgeBases(nextKnowledgeBases); setKnowledgeReview(nextReview); setBrandKit(nextBrandKit)
+      setOrganizations(nextOrganizations); setUser(profile); setConversations(nextConversations); setPrompts(nextPrompts); setSettings(nextSettings); setModels(modelPolicy.models); setMembers(nextMembers); setInvitations(nextInvitations); setAuditEvents(nextAudit); setKnowledgeBases(nextKnowledgeBases); setKnowledgeReview(nextReview); setDocumentTemplate(nextDocumentTemplate)
       if (nextConversations.length) { setActiveConversationId(nextConversations[0].id); setSelectedKnowledgeBaseIds(nextConversations[0].knowledge_base_ids); setWebSearchEnabled(nextConversations[0].web_search_enabled) }
       else { setSelectedKnowledgeBaseIds(nextKnowledgeBases.map((item) => item.id)); setWebSearchEnabled(nextSettings.web_search_default) }
       if (nextKnowledgeBases.length) setActiveKnowledgeBaseId(nextKnowledgeBases[0].id)
@@ -78,6 +78,21 @@ export function JulesApp(props: JulesAppProps = {}) {
     })
     return () => { cancelled = true }
   }, [activeOrganizationId])
+
+  useEffect(() => {
+    const pendingId = documentTemplate.pending_version?.id
+    if (!backendConnected.current || !pendingId) return
+    let cancelled = false
+    const timer = window.setTimeout(() => {
+      julesApi.documentTemplate(activeOrganizationId).then((next) => {
+        if (cancelled) return
+        setDocumentTemplate(next)
+        if (next.active_version_id === pendingId) toast.success("Organization document template is ready")
+        else if (next.versions.find((version) => version.id === pendingId)?.status === "failed") toast.error("The document template could not be activated")
+      }).catch(() => undefined)
+    }, 1500)
+    return () => { cancelled = true; window.clearTimeout(timer) }
+  }, [activeOrganizationId, documentTemplate.pending_version?.id, documentTemplate.pending_version?.status])
 
   useEffect(() => {
     if (!backendConnected.current || !activeConversationId) return
@@ -160,10 +175,26 @@ export function JulesApp(props: JulesAppProps = {}) {
   function updateArtifactInMessages(nextArtifact: Artifact) {
     setMessages((current) => {
       const next = { ...current }
+      let attached = false
       for (const [conversationId, rows] of Object.entries(next)) {
-        next[conversationId] = rows.map((message) => message.artifacts?.some((item) => item.id === nextArtifact.id)
-          ? { ...message, artifacts: message.artifacts.map((item) => item.id === nextArtifact.id ? nextArtifact : item) }
-          : message)
+        next[conversationId] = rows.map((message) => {
+          if (!message.artifacts?.some((item) => item.id === nextArtifact.id)) return message
+          attached = true
+          return { ...message, artifacts: message.artifacts.map((item) => item.id === nextArtifact.id ? nextArtifact : item) }
+        })
+      }
+      if (!attached) {
+        const rows = next[nextArtifact.conversation_id]
+        if (rows) {
+          const fallbackIndex = rows.findLastIndex((message) => message.role === "assistant")
+          const targetIndex = nextArtifact.message_id ? rows.findIndex((message) => message.id === nextArtifact.message_id) : fallbackIndex
+          const index = targetIndex >= 0 ? targetIndex : fallbackIndex
+          if (index >= 0) {
+            next[nextArtifact.conversation_id] = rows.map((message, messageIndex) => messageIndex === index
+              ? { ...message, artifacts: [...(message.artifacts ?? []), nextArtifact] }
+              : message)
+          }
+        }
       }
       return next
     })
@@ -181,7 +212,12 @@ export function JulesApp(props: JulesAppProps = {}) {
         const next = await julesApi.artifact(organizationId, artifactId)
         updateArtifactInMessages(next)
         if (["ready", "failed", "cancelled"].includes(next.status)) {
-          if (next.status === "ready") toast.success(`${next.format.toUpperCase()} file is ready`)
+          if (next.status === "ready") toast.success(`${next.format.toUpperCase()} file is ready`, {
+            action: {
+              label: "Show file",
+              onClick: () => document.getElementById(`artifact-${next.id}`)?.scrollIntoView({ behavior: "smooth", block: "center" }),
+            },
+          })
           if (next.status === "failed") toast.error(next.error || "File generation failed")
           return
         }
@@ -294,20 +330,34 @@ export function JulesApp(props: JulesAppProps = {}) {
     toast.success("Preferences saved")
   }
 
-  async function saveBrandKit(next: OrganizationBrandKit) {
+  async function uploadDocumentTemplate(file: File) {
     try {
-      const updated = await julesApi.updateBrandKit(activeOrganizationId, next)
-      setBrandKit(updated)
-      toast.success("Organization brand kit saved")
-    } catch (error) { toast.error(error instanceof Error ? error.message : "Brand kit could not be saved.") }
+      const updated = await julesApi.uploadDocumentTemplate(activeOrganizationId, file)
+      setDocumentTemplate(updated)
+      toast.success("Template uploaded and queued for validation")
+    } catch (error) { toast.error(error instanceof Error ? error.message : "Document template could not be uploaded.") }
   }
 
-  async function uploadBrandLogo(file: File) {
+  async function activateDocumentTemplate(versionId: string) {
     try {
-      const updated = await julesApi.uploadBrandLogo(activeOrganizationId, file)
-      setBrandKit(updated)
-      toast.success("Brand logo uploaded")
-    } catch (error) { toast.error(error instanceof Error ? error.message : "Brand logo could not be uploaded.") }
+      setDocumentTemplate(await julesApi.activateDocumentTemplate(activeOrganizationId, versionId))
+      toast.success("Organization document template activated")
+    } catch (error) { toast.error(error instanceof Error ? error.message : "Document template could not be activated.") }
+  }
+
+  async function disableDocumentTemplate() {
+    try {
+      setDocumentTemplate(await julesApi.disableDocumentTemplate(activeOrganizationId))
+      toast.success("Organization document template disabled")
+    } catch (error) { toast.error(error instanceof Error ? error.message : "Document template could not be disabled.") }
+  }
+
+  async function downloadDocumentTemplate(version: DocumentTemplateVersion) {
+    try {
+      const blob = await julesApi.documentTemplateBlob(activeOrganizationId, version.id)
+      const url = URL.createObjectURL(blob); const link = document.createElement("a")
+      link.href = url; link.download = version.file_name; link.click(); URL.revokeObjectURL(url)
+    } catch (error) { toast.error(error instanceof Error ? error.message : "Document template could not be downloaded.") }
   }
 
   function artifactUpdated(artifact: Artifact) {
@@ -476,7 +526,7 @@ export function JulesApp(props: JulesAppProps = {}) {
     {visibleView === "knowledge" ? <KnowledgeView knowledgeBases={knowledgeBases} activeKnowledgeBase={activeKnowledgeBase} members={members} role={activeRole} onSelect={setActiveKnowledgeBaseId} onCreate={(title, description) => void createKnowledgeBase(title, description)} onUpdate={(knowledgeBaseId, title, description) => void updateKnowledgeBaseDetails(knowledgeBaseId, title, description)} onUpload={(knowledgeBaseId, files) => void uploadKnowledge(knowledgeBaseId, files)} onUpdateAccess={(knowledgeBaseId, userIds, reason) => void updateKnowledgeAccess(knowledgeBaseId, userIds, reason)} onArchive={(knowledgeBaseId) => void archiveKnowledgeBase(knowledgeBaseId)} onOpenMobileNavigation={() => setMobileNavigationOpen(true)} /> : null}
     {visibleView === "review" && canReviewKnowledge ? <KnowledgeReviewView review={knowledgeReview} onResolveConflict={(id, action) => void resolveConflict(id, action)} onReviewProposal={(id, decision) => void reviewProposal(id, decision)} onOpenMobileNavigation={() => setMobileNavigationOpen(true)} /> : null}
     {visibleView === "prompts" ? <PromptLibrary prompts={prompts} role={activeRole} onUsePrompt={(body) => { if (draft.trim() && !window.confirm("Replace the text already in the composer?")) return; setDraft(body); setActiveView("chat") }} onFavorite={(id) => void toggleFavorite(id)} onSave={(value, id) => void savePrompt(value, id)} onLoadVersions={loadPromptVersions} onRestoreVersion={restorePromptVersion} onOpenMobileNavigation={() => setMobileNavigationOpen(true)} /> : null}
-    {visibleView === "settings" ? <SettingsView key={`${activeOrganizationId}-${settings.theme}-${settings.default_model}-${settings.default_effort}-${settings.custom_instructions}-${settings.web_search_default}-${brandKit.updated_at}`} settings={settings} brandKit={brandKit} models={models} organizations={organizations} activeOrganizationId={activeOrganizationId} onOrganizationChange={switchOrganization} onManageOrganizations={() => setOrganizationDialogOpen(true)} onLeaveOrganization={(id) => void leaveOrganization(id)} onSave={(next) => void saveSettings(next)} onSaveBrandKit={(next) => void saveBrandKit(next)} onUploadBrandLogo={(file) => void uploadBrandLogo(file)} onDeleteAllConversations={() => void deleteAllConversations()} onDeleteAccount={() => void deleteAccount()} onOpenMobileNavigation={() => setMobileNavigationOpen(true)} /> : null}
+    {visibleView === "settings" ? <SettingsView key={`${activeOrganizationId}-${settings.theme}-${settings.default_model}-${settings.default_effort}-${settings.custom_instructions}-${settings.web_search_default}`} settings={settings} documentTemplate={documentTemplate} models={models} organizations={organizations} activeOrganizationId={activeOrganizationId} onOrganizationChange={switchOrganization} onManageOrganizations={() => setOrganizationDialogOpen(true)} onLeaveOrganization={(id) => void leaveOrganization(id)} onSave={(next) => void saveSettings(next)} onUploadDocumentTemplate={(file) => void uploadDocumentTemplate(file)} onActivateDocumentTemplate={(versionId) => void activateDocumentTemplate(versionId)} onDisableDocumentTemplate={() => void disableDocumentTemplate()} onDownloadDocumentTemplate={(version) => void downloadDocumentTemplate(version)} onDeleteAllConversations={() => void deleteAllConversations()} onDeleteAccount={() => void deleteAccount()} onOpenMobileNavigation={() => setMobileNavigationOpen(true)} /> : null}
     {visibleView === "organization" ? <OrganizationView organizationName={organizations.find((item) => item.id === activeOrganizationId)?.name ?? "Organization"} members={members} invitations={invitations} auditEvents={auditEvents} models={models} onInvite={invite} onSavePolicy={(defaultModel, maximumEffort) => void saveModelPolicy(defaultModel, maximumEffort)} onResendInvitation={resendInvitation} onRevokeInvitation={(id) => void revokeInvitation(id)} onOpenMobileNavigation={() => setMobileNavigationOpen(true)} /> : null}
     <OrganizationAccessDialog open={organizationDialogOpen} onOpenChange={setOrganizationDialogOpen} onOrganizationReady={organizationReady} />
   </main>

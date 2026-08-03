@@ -1,4 +1,4 @@
-import type { Artifact, ArtifactRequest, AuditEvent, AuthBootstrap, Conversation, Invitation, InvitationPreview, KnowledgeBase, KnowledgeReview, Member, Message, ModelOption, Organization, OrganizationBrandKit, Prompt, PromptVersion, StreamEvent, UserProfile, UserSettings } from "@/lib/types"
+import type { Artifact, ArtifactRequest, AuditEvent, AuthBootstrap, Conversation, Invitation, InvitationPreview, KnowledgeBase, KnowledgeReview, Member, Message, ModelOption, Organization, OrganizationDocumentTemplate, Prompt, PromptVersion, StreamEvent, UserProfile, UserSettings } from "@/lib/types"
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000/v1"
 export const AUTH_MODE = process.env.NEXT_PUBLIC_AUTH_MODE ?? "development"
@@ -54,13 +54,24 @@ export const julesApi = {
   restorePrompt: (organizationId: string, id: string, version: number) => request<Prompt>(`/prompts/${id}/versions/${version}/restore`, organizationId, { method: "POST" }),
   settings: (organizationId: string) => request<UserSettings>("/settings", organizationId),
   updateSettings: (organizationId: string, body: Partial<UserSettings>) => request<UserSettings>("/settings", organizationId, { method: "PATCH", body: JSON.stringify(body) }),
-  brandKit: (organizationId: string) => request<OrganizationBrandKit>("/organizations/current/brand-kit", organizationId),
-  updateBrandKit: (organizationId: string, body: Partial<OrganizationBrandKit>) => request<OrganizationBrandKit>("/organizations/current/brand-kit", organizationId, { method: "PATCH", body: JSON.stringify(body) }),
-  async uploadBrandLogo(organizationId: string, file: File) {
+  documentTemplate: (organizationId: string) => request<OrganizationDocumentTemplate>("/organizations/current/document-template", organizationId),
+  async uploadDocumentTemplate(organizationId: string, file: File) {
     const form = new FormData(); form.append("upload", file)
-    const response = await fetch(`${API_URL}/organizations/current/brand-kit/logo`, { method: "POST", headers: await headers(organizationId, false), body: form })
-    if (!response.ok) { const error = await response.json().catch(() => ({ detail: "Logo upload failed" })); throw new Error(error.detail ?? "Logo upload failed") }
-    return response.json() as Promise<OrganizationBrandKit>
+    const response = await fetch(`${API_URL}/organizations/current/document-template`, { method: "POST", headers: await headers(organizationId, false), body: form })
+    if (!response.ok) { const error = await response.json().catch(() => ({ detail: "Template upload failed" })); throw new Error(error.detail ?? "Template upload failed") }
+    return response.json() as Promise<OrganizationDocumentTemplate>
+  },
+  activateDocumentTemplate: (organizationId: string, versionId: string) => request<OrganizationDocumentTemplate>(`/organizations/current/document-template/versions/${versionId}/activate`, organizationId, { method: "POST" }),
+  disableDocumentTemplate: (organizationId: string) => request<OrganizationDocumentTemplate>("/organizations/current/document-template/disable", organizationId, { method: "POST" }),
+  async documentTemplateBlob(organizationId: string, versionId: string) {
+    const response = await fetch(`${API_URL}/organizations/current/document-template/versions/${versionId}/download`, { headers: await headers(organizationId, false) })
+    if (!response.ok) throw new Error("Document template download failed")
+    return response.blob()
+  },
+  async documentTemplatePreviewBlob(organizationId: string, versionId: string, previewNumber: number) {
+    const response = await fetch(`${API_URL}/organizations/current/document-template/versions/${versionId}/previews/${previewNumber}`, { headers: await headers(organizationId, false) })
+    if (!response.ok) throw new Error("Document template preview is unavailable")
+    return response.blob()
   },
   members: (organizationId: string) => request<Member[]>("/organizations/current/members", organizationId),
   invitations: (organizationId: string) => request<Invitation[]>("/organizations/current/invitations", organizationId),
@@ -87,7 +98,7 @@ export const julesApi = {
   createKnowledgeProposal: (organizationId: string, body: { knowledge_base_id: string; conversation_id?: string; message_id?: string; title: string; content: string }) => request<{ id: string; status: string }>("/knowledge-proposals", organizationId, { method: "POST", body: JSON.stringify(body) }),
   feedback: (organizationId: string, messageId: string, rating: "helpful" | "incorrect" | "outdated", note = "") => request<void>(`/messages/${messageId}/feedback`, organizationId, { method: "POST", body: JSON.stringify({ rating, note }) }),
   artifact: (organizationId: string, artifactId: string) => request<Artifact>(`/artifacts/${artifactId}`, organizationId),
-  reviseArtifact: (organizationId: string, artifactId: string, instructions: string) => request<Artifact>(`/artifacts/${artifactId}/revisions`, organizationId, { method: "POST", body: JSON.stringify({ instructions }) }),
+  reviseArtifact: (organizationId: string, artifactId: string, instructions: string, useCurrentDocumentTemplate = false) => request<Artifact>(`/artifacts/${artifactId}/revisions`, organizationId, { method: "POST", body: JSON.stringify({ instructions, use_current_document_template: useCurrentDocumentTemplate }) }),
   retryArtifact: (organizationId: string, artifactId: string) => request<Artifact>(`/artifacts/${artifactId}/retry`, organizationId, { method: "POST" }),
   cancelArtifact: (organizationId: string, artifactId: string) => request<Artifact>(`/artifacts/${artifactId}/cancel`, organizationId, { method: "POST" }),
   deleteArtifact: (organizationId: string, artifactId: string) => request<void>(`/artifacts/${artifactId}`, organizationId, { method: "DELETE" }),

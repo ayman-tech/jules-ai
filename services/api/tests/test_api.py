@@ -376,7 +376,7 @@ def test_editable_artifact_generation_download_and_revision(format_name, expecte
             "attachment_ids": [],
             "knowledge_base_ids": [],
             "web_search_enabled": False,
-            "artifact_request": {"format": format_name, "template_id": "auto", "use_brand_kit": True},
+            "artifact_request": {"format": format_name, "template_id": "auto", "use_document_template": True},
         }) as response:
             body = "".join(response.iter_text())
         assert response.status_code == 200
@@ -403,12 +403,13 @@ def test_editable_artifact_generation_download_and_revision(format_name, expecte
         assert all(item["status"] == "ready" for item in versions)
 
 
-def test_artifact_natural_request_pdf_handling_brand_permissions_and_cancellation():
+def test_artifact_natural_request_pdf_handling_template_permissions_and_cancellation():
     with TestClient(app) as client:
-        assert client.patch("/v1/organizations/current/brand-kit", headers=MEMBER, json={"primary_color": "#112233"}).status_code == 403
-        brand = client.patch("/v1/organizations/current/brand-kit", headers=ADMIN, json={"primary_color": "#38146D", "accent_color": "#7C3AED", "heading_font": "Arial", "body_font": "Calibri"})
-        assert brand.status_code == 200
-        assert brand.json()["primary_color"] == "#38146D"
+        assert client.post(
+            "/v1/organizations/current/document-template",
+            headers=MEMBER,
+            files={"upload": ("template.docx", b"not-a-document", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")},
+        ).status_code == 403
 
         with client.stream("POST", "/v1/conversations/conversation-quarterly/messages/stream", headers=OWNER, json={"content": "Make a PDF study plan for calculus", "knowledge_base_ids": [], "web_search_enabled": False}) as response:
             pdf_body = "".join(response.iter_text())
@@ -423,3 +424,99 @@ def test_artifact_natural_request_pdf_handling_brand_permissions_and_cancellatio
         assert cancelled.status_code == 200
         assert cancelled.json()["status"] == "cancelled"
         assert client.get(f"/v1/artifacts/{artifact['id']}", headers=MEMBER).status_code == 404
+
+
+def _word_template_bytes(*, multiple_sections: bool = False) -> bytes:
+    from docx import Document
+    from docx.enum.section import WD_SECTION
+
+    document = Document()
+    document.sections[0].header.paragraphs[0].text = "Northstar Advisory letterhead"
+    document.sections[0].footer.paragraphs[0].text = "Confidential"
+    document.add_paragraph("THIS SAMPLE BODY MUST BE REMOVED")
+    if multiple_sections:
+        document.add_section(WD_SECTION.NEW_PAGE)
+    output = BytesIO()
+    document.save(output)
+    return output.getvalue()
+
+
+def test_document_template_validation_activation_and_artifact_fidelity():
+    with TestClient(app) as client:
+        dotx = client.post(
+            "/v1/organizations/current/document-template",
+            headers=OWNER,
+            files={"upload": ("letterhead.dotx", b"not-used", "application/vnd.openxmlformats-officedocument.wordprocessingml.template")},
+        )
+        assert dotx.status_code == 415
+        assert "Word Document (.docx)" in dotx.json()["detail"]
+
+        multiple = client.post(
+            "/v1/organizations/current/document-template",
+            headers=OWNER,
+            files={"upload": ("multi.docx", _word_template_bytes(multiple_sections=True), "application/vnd.openxmlformats-officedocument.wordprocessingml.document")},
+        )
+        assert multiple.status_code == 422
+        assert "exactly one Word section" in multiple.json()["detail"]
+
+        uploaded = client.post(
+            "/v1/organizations/current/document-template",
+            headers=OWNER,
+            files={"upload": ("northstar-letterhead.docx", _word_template_bytes(), "application/vnd.openxmlformats-officedocument.wordprocessingml.document")},
+        )
+        assert uploaded.status_code == 202
+        pending = uploaded.json()["pending_version"]
+        assert pending["status"] == "queued"
+        assert uploaded.json()["active_version"] is None
+
+        assert asyncio.run(run_artifact_once()) is True
+        template = client.get("/v1/organizations/current/document-template", headers=OWNER).json()
+        assert template["enabled"] is True
+        assert template["active_version"]["id"] == pending["id"]
+        assert template["active_version"]["validation_report"]["sample_body_discarded"] is True
+        assert client.get("/v1/organizations/current/document-template", headers=MEMBER).json()["can_manage"] is False
+
+        with client.stream("POST", "/v1/conversations/conversation-quarterly/messages/stream", headers=OWNER, json={
+            "content": "Create an editable document explaining a practical AI rollout.",
+            "knowledge_base_ids": [],
+            "web_search_enabled": False,
+            "artifact_request": {"format": "docx", "template_id": "auto", "use_document_template": True},
+        }) as response:
+            queued = _sse_payload("".join(response.iter_text()), "artifact_queued")["artifact"]
+        assert queued["version"]["document_template_version_id"] == pending["id"]
+        assert asyncio.run(run_artifact_once()) is True
+        ready = client.get(f"/v1/artifacts/{queued['id']}", headers=OWNER).json()
+        assert ready["version"]["qa"]["manual_page_breaks"] == 0
+        download = client.get(f"/v1/artifacts/{queued['id']}/download", headers=OWNER)
+        with zipfile.ZipFile(BytesIO(download.content)) as archive:
+            document_xml = archive.read("word/document.xml").decode("utf-8")
+            header_xml = "\n".join(archive.read(name).decode("utf-8") for name in archive.namelist() if name.startswith("word/header"))
+        assert "THIS SAMPLE BODY MUST BE REMOVED" not in document_xml
+        assert "Northstar Advisory letterhead" in header_xml
+        assert 'w:type="page"' not in document_xml
+
+        rejected_replacement = client.post(
+            "/v1/organizations/current/document-template",
+            headers=OWNER,
+            files={"upload": ("invalid-replacement.docx", _word_template_bytes(multiple_sections=True), "application/vnd.openxmlformats-officedocument.wordprocessingml.document")},
+        )
+        assert rejected_replacement.status_code == 422
+        assert client.get("/v1/organizations/current/document-template", headers=OWNER).json()["active_version_id"] == pending["id"]
+
+        with client.stream("POST", "/v1/conversations/conversation-quarterly/messages/stream", headers=OWNER, json={
+            "content": "Create an editable unbranded document.",
+            "knowledge_base_ids": [],
+            "web_search_enabled": False,
+            "artifact_request": {"format": "docx", "template_id": "auto", "use_document_template": False},
+        }) as response:
+            untemplated = _sse_payload("".join(response.iter_text()), "artifact_queued")["artifact"]
+        assert untemplated["version"]["document_template_version_id"] is None
+        assert client.post(f"/v1/artifacts/{untemplated['id']}/cancel", headers=OWNER).status_code == 200
+
+        revised = client.post(f"/v1/artifacts/{queued['id']}/revisions", headers=OWNER, json={"instructions": "Shorten the introduction."})
+        assert revised.status_code == 202
+        assert revised.json()["version"]["document_template_version_id"] == pending["id"]
+
+        disabled = client.post("/v1/organizations/current/document-template/disable", headers=ADMIN)
+        assert disabled.status_code == 200
+        assert disabled.json()["enabled"] is False

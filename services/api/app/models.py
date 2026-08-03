@@ -180,19 +180,59 @@ class OrganizationModelPolicy(Base, TimestampMixin):
     maximum_effort: Mapped[str] = mapped_column(String(16), default="high")
 
 
-class OrganizationBrandKit(Base, TimestampMixin):
-    __tablename__ = "organization_brand_kits"
+class OrganizationDocumentTemplate(Base, TimestampMixin):
+    __tablename__ = "organization_document_templates"
     __table_args__ = (UniqueConstraint("organization_id"),)
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id", ondelete="CASCADE"), index=True)
-    logo_storage_key: Mapped[str | None] = mapped_column(String(1000), unique=True)
-    logo_file_name: Mapped[str | None] = mapped_column(String(320))
-    logo_mime_type: Mapped[str | None] = mapped_column(String(160))
-    primary_color: Mapped[str] = mapped_column(String(7), default="#4C1D95")
-    accent_color: Mapped[str] = mapped_column(String(7), default="#7C3AED")
-    heading_font: Mapped[str] = mapped_column(String(80), default="Aptos Display")
-    body_font: Mapped[str] = mapped_column(String(80), default="Aptos")
-    footer_text: Mapped[str] = mapped_column(String(240), default="")
+    active_version_id: Mapped[str | None] = mapped_column(String(36), index=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
+class OrganizationDocumentTemplateVersion(Base, TimestampMixin):
+    __tablename__ = "organization_document_template_versions"
+    __table_args__ = (
+        UniqueConstraint("template_id", "version_number"),
+        Index("ix_document_template_version_scope", "organization_id", "template_id", "version_number"),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id", ondelete="CASCADE"), index=True)
+    template_id: Mapped[str] = mapped_column(ForeignKey("organization_document_templates.id", ondelete="CASCADE"), index=True)
+    version_number: Mapped[int] = mapped_column(Integer)
+    file_name: Mapped[str] = mapped_column(String(320))
+    mime_type: Mapped[str] = mapped_column(String(160))
+    size_bytes: Mapped[int] = mapped_column(Integer)
+    storage_key: Mapped[str] = mapped_column(String(1000), unique=True)
+    sha256: Mapped[str] = mapped_column(String(64), index=True)
+    status: Mapped[str] = mapped_column(String(24), default="queued")
+    validation_report_json: Mapped[str] = mapped_column(Text, default="{}")
+    preview_keys_json: Mapped[str] = mapped_column(Text, default="[]")
+    uploaded_by: Mapped[str] = mapped_column(ForeignKey("users.id"))
+    activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    error: Mapped[str | None] = mapped_column(Text)
+
+
+class DocumentTemplateValidationJob(Base, TimestampMixin):
+    __tablename__ = "document_template_validation_jobs"
+    __table_args__ = (Index("ix_document_template_job_status", "status", "created_at"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id", ondelete="CASCADE"), index=True)
+    template_version_id: Mapped[str] = mapped_column(ForeignKey("organization_document_template_versions.id", ondelete="CASCADE"), unique=True)
+    status: Mapped[str] = mapped_column(String(24), default="queued")
+    progress: Mapped[int] = mapped_column(Integer, default=0)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    error: Mapped[str | None] = mapped_column(Text)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class StorageCleanupJob(Base, TimestampMixin):
+    __tablename__ = "storage_cleanup_jobs"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    storage_key: Mapped[str] = mapped_column(String(1000), unique=True)
+    reason: Mapped[str] = mapped_column(String(120))
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    error: Mapped[str | None] = mapped_column(Text)
 
 
 class AuditEvent(Base):
@@ -321,7 +361,7 @@ class GeneratedArtifact(Base, TimestampMixin):
     title: Mapped[str] = mapped_column(String(240))
     format: Mapped[str] = mapped_column(String(8))
     template_id: Mapped[str] = mapped_column(String(80), default="auto")
-    use_brand_kit: Mapped[bool] = mapped_column(Boolean, default=True)
+    use_document_template: Mapped[bool] = mapped_column(Boolean, default=True)
     status: Mapped[str] = mapped_column(String(24), default="queued")
     current_version: Mapped[int] = mapped_column(Integer, default=1)
     source_scope_json: Mapped[str] = mapped_column(Text, default="{}")
@@ -342,6 +382,10 @@ class ArtifactVersion(Base, TimestampMixin):
     status: Mapped[str] = mapped_column(String(24), default="queued")
     instructions: Mapped[str] = mapped_column(Text)
     source_scope_json: Mapped[str] = mapped_column(Text, default="{}")
+    document_template_version_id: Mapped[str | None] = mapped_column(
+        ForeignKey("organization_document_template_versions.id", ondelete="SET NULL"), index=True
+    )
+    document_template_snapshot_json: Mapped[str] = mapped_column(Text, default="{}")
     storage_key: Mapped[str | None] = mapped_column(String(1000), unique=True)
     file_name: Mapped[str | None] = mapped_column(String(320))
     mime_type: Mapped[str | None] = mapped_column(String(160))

@@ -34,6 +34,7 @@ from .models import (
     AuditEvent,
     Conversation,
     ConversationSummary,
+    DocumentTemplateValidationJob,
     GeneratedArtifact,
     IngestionJob,
     Invitation,
@@ -49,7 +50,8 @@ from .models import (
     MessageCitation,
     ModelConfiguration,
     Organization,
-    OrganizationBrandKit,
+    OrganizationDocumentTemplate,
+    OrganizationDocumentTemplateVersion,
     OrganizationModelPolicy,
     Prompt,
     PromptFavorite,
@@ -61,7 +63,14 @@ from .models import (
     new_id,
     utc_now,
 )
-from .artifacts import CURATED_FONTS, FORMAT_SUFFIXES, MIME_TYPES, choose_template, delete_artifact_files, detect_requested_format
+from .artifacts import FORMAT_SUFFIXES, MIME_TYPES, choose_template, delete_artifact_files, detect_requested_format
+from .document_templates import (
+    DOCX_MIME_TYPE,
+    TemplateValidationError,
+    delete_document_template_files,
+    document_template_json,
+    validate_template_package,
+)
 from .knowledge import authorized_knowledge_base_ids, embedding_for, format_internal_context, retrieve_company_knowledge
 from .model_catalog import DEFAULT_MODEL_ID, MODEL_CATALOG, MODEL_IDS
 from .observability import (
@@ -189,7 +198,7 @@ class ConversationUpdate(BaseModel):
 class ArtifactRequest(BaseModel):
     format: Literal["docx", "pptx"]
     template_id: str = Field(default="auto", min_length=1, max_length=80)
-    use_brand_kit: bool = True
+    use_document_template: bool = True
 
 
 class MessageCreate(BaseModel):
@@ -204,19 +213,12 @@ class MessageCreate(BaseModel):
 
 class ArtifactRevisionCreate(BaseModel):
     instructions: str = Field(min_length=1, max_length=100_000)
+    use_current_document_template: bool = False
 
 
 class ArtifactSaveKnowledge(BaseModel):
     knowledge_base_id: str
     title: str | None = Field(default=None, max_length=320)
-
-
-class BrandKitUpdate(BaseModel):
-    primary_color: str | None = Field(default=None, pattern=r"^#[0-9A-Fa-f]{6}$")
-    accent_color: str | None = Field(default=None, pattern=r"^#[0-9A-Fa-f]{6}$")
-    heading_font: str | None = Field(default=None, max_length=80)
-    body_font: str | None = Field(default=None, max_length=80)
-    footer_text: str | None = Field(default=None, max_length=240)
 
 
 class PromptCreate(BaseModel):
@@ -485,6 +487,8 @@ async def artifact_json(db: AsyncSession, row: GeneratedArtifact) -> dict[str, A
             "page_count": item.page_count,
             "preview_count": len(preview_keys),
             "qa": json.loads(item.qa_json or "{}"),
+            "document_template_version_id": item.document_template_version_id,
+            "document_template_snapshot": json.loads(item.document_template_snapshot_json or "{}"),
             "error": item.error,
             "created_at": as_iso(item.created_at),
             "citations": [{
@@ -513,7 +517,7 @@ async def artifact_json(db: AsyncSession, row: GeneratedArtifact) -> dict[str, A
         "title": row.title,
         "format": row.format,
         "template_id": row.template_id,
-        "use_brand_kit": row.use_brand_kit,
+        "use_document_template": row.use_document_template,
         "status": row.status,
         "current_version": row.current_version,
         "progress": job.progress if job else (100 if row.status == "ready" else 0),
@@ -534,7 +538,7 @@ async def queue_artifact(
     instructions: str,
     format_name: str,
     template_id: str,
-    use_brand_kit: bool,
+    use_document_template: bool,
     model: str,
     effort: str,
     knowledge_base_ids: list[str],
@@ -550,6 +554,23 @@ async def queue_artifact(
         "model": model,
         "effort": effort,
     }
+    document_template_version: OrganizationDocumentTemplateVersion | None = None
+    document_template_snapshot: dict[str, Any] = {}
+    if format_name == "docx" and use_document_template:
+        organization_template = await db.scalar(select(OrganizationDocumentTemplate).where(
+            OrganizationDocumentTemplate.organization_id == context.organization_id,
+            OrganizationDocumentTemplate.enabled.is_(True),
+        ))
+        if organization_template and organization_template.active_version_id:
+            candidate = await db.get(OrganizationDocumentTemplateVersion, organization_template.active_version_id)
+            if candidate and candidate.organization_id == context.organization_id and candidate.status == "ready":
+                document_template_version = candidate
+                document_template_snapshot = {
+                    "id": candidate.id,
+                    "version_number": candidate.version_number,
+                    "file_name": candidate.file_name,
+                    "sha256": candidate.sha256,
+                }
     title = re.sub(r"\s+", " ", instructions).strip()[:100].rstrip(" .") or "Jules AI file"
     artifact = GeneratedArtifact(
         organization_id=context.organization_id,
@@ -559,7 +580,7 @@ async def queue_artifact(
         title=title,
         format=format_name,
         template_id=choose_template(format_name, instructions, template_id),
-        use_brand_kit=use_brand_kit,
+        use_document_template=use_document_template,
         source_scope_json=json.dumps(scope),
     )
     db.add(artifact)
@@ -571,13 +592,15 @@ async def queue_artifact(
         version_number=1,
         instructions=instructions,
         source_scope_json=json.dumps(scope),
+        document_template_version_id=document_template_version.id if document_template_version else None,
+        document_template_snapshot_json=json.dumps(document_template_snapshot),
     )
     db.add(version)
     await db.flush()
     db.add(ArtifactJob(organization_id=context.organization_id, artifact_id=artifact.id, version_id=version.id))
-    await audit(db, context, "artifact.queued", "artifact", artifact.id, {"format": format_name, "template_id": artifact.template_id})
+    await audit(db, context, "artifact.queued", "artifact", artifact.id, {"format": format_name, "template_id": artifact.template_id, "document_template_version_id": document_template_version.id if document_template_version else None})
     await db.commit()
-    log_event(logger, logging.INFO, "artifact.queued", artifact_id=artifact.id, version_id=version.id, conversation_id=conversation.id, format=format_name, template_id=artifact.template_id, knowledge_base_count=len(knowledge_base_ids), attachment_count=len(attachment_ids), web_search_enabled=web_search_enabled)
+    log_event(logger, logging.INFO, "artifact.queued", artifact_id=artifact.id, version_id=version.id, conversation_id=conversation.id, format=format_name, template_id=artifact.template_id, document_template_version_id=document_template_version.id if document_template_version else None, knowledge_base_count=len(knowledge_base_ids), attachment_count=len(attachment_ids), web_search_enabled=web_search_enabled)
     return artifact
 
 
@@ -739,81 +762,150 @@ async def update_organization(payload: OrganizationUpdate, context: RequestConte
     return {"id": organization.id, "name": organization.name, "slug": organization.slug, "role": context.role}
 
 
-def brand_kit_json(row: OrganizationBrandKit | None, can_manage: bool) -> dict[str, Any]:
-    return {
-        "primary_color": row.primary_color if row else "#4C1D95",
-        "accent_color": row.accent_color if row else "#7C3AED",
-        "heading_font": row.heading_font if row else "Aptos Display",
-        "body_font": row.body_font if row else "Aptos",
-        "footer_text": row.footer_text if row else "",
-        "logo_file_name": row.logo_file_name if row else None,
-        "logo_mime_type": row.logo_mime_type if row else None,
-        "has_logo": bool(row and row.logo_storage_key),
-        "can_manage": can_manage,
-        "available_fonts": sorted(CURATED_FONTS),
-        "updated_at": as_iso(row.updated_at) if row else None,
-    }
+@app.get("/v1/organizations/current/document-template")
+async def get_document_template(context: RequestContext = Depends(get_context), db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+    row = await db.scalar(select(OrganizationDocumentTemplate).where(
+        OrganizationDocumentTemplate.organization_id == context.organization_id,
+    ))
+    return await document_template_json(db, row, can_manage=context.role in {"owner", "admin"})
 
 
-@app.get("/v1/organizations/current/brand-kit")
-async def get_brand_kit(context: RequestContext = Depends(get_context), db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
-    row = await db.scalar(select(OrganizationBrandKit).where(OrganizationBrandKit.organization_id == context.organization_id))
-    return brand_kit_json(row, context.role in {"owner", "admin"})
-
-
-@app.patch("/v1/organizations/current/brand-kit")
-async def update_brand_kit(payload: BrandKitUpdate, context: RequestContext = Depends(require_role("owner", "admin")), db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
-    values = payload.model_dump(exclude_unset=True)
-    if values.get("heading_font") not in CURATED_FONTS and "heading_font" in values:
-        raise HTTPException(status_code=422, detail="Heading font is not available")
-    if values.get("body_font") not in CURATED_FONTS and "body_font" in values:
-        raise HTTPException(status_code=422, detail="Body font is not available")
-    row = await db.scalar(select(OrganizationBrandKit).where(OrganizationBrandKit.organization_id == context.organization_id))
-    if not row:
-        row = OrganizationBrandKit(organization_id=context.organization_id)
-        db.add(row)
-    for key, value in values.items():
-        setattr(row, key, value)
-    await audit(db, context, "brand_kit.updated", "organization", context.organization_id, {"fields": sorted(values)})
-    await db.commit()
-    return brand_kit_json(row, True)
-
-
-@app.post("/v1/organizations/current/brand-kit/logo")
-async def upload_brand_logo(upload: UploadFile = File(...), context: RequestContext = Depends(require_role("owner", "admin")), db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+@app.post("/v1/organizations/current/document-template", status_code=202)
+async def upload_document_template(
+    upload: UploadFile = File(...),
+    context: RequestContext = Depends(require_role("owner", "admin")),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
     file_name = safe_file_name(upload.filename)
     suffix = Path(file_name).suffix.lower()
-    if suffix not in {".png", ".jpg", ".jpeg"} or upload.content_type not in {"image/png", "image/jpeg"}:
-        raise HTTPException(status_code=415, detail="Brand logos must be PNG or JPEG images")
-    data = await upload.read(5 * 1024 * 1024 + 1)
-    if len(data) > 5 * 1024 * 1024:
-        raise HTTPException(status_code=413, detail="Brand logo exceeds the 5 MB limit")
-    scan_status = await malware_scanner.scan(name=file_name, mime_type=upload.content_type, data=data)
+    if suffix == ".dotx":
+        raise HTTPException(status_code=415, detail="Save the template as a Word Document (.docx), then upload it again")
+    if suffix != ".docx":
+        raise HTTPException(status_code=415, detail="Organization document templates must be Word Document (.docx) files")
+    data = await upload.read(settings.document_template_max_bytes + 1)
+    if len(data) > settings.document_template_max_bytes:
+        raise HTTPException(status_code=413, detail="Document template exceeds the 15 MB limit")
+    scan_status = await malware_scanner.scan(name=file_name, mime_type=upload.content_type or DOCX_MIME_TYPE, data=data)
     if scan_status == "infected" or (scan_status == "unavailable" and settings.app_env != "development"):
-        raise HTTPException(status_code=422 if scan_status == "infected" else 503, detail="Brand logo could not be accepted")
-    row = await db.scalar(select(OrganizationBrandKit).where(OrganizationBrandKit.organization_id == context.organization_id))
-    if not row:
-        row = OrganizationBrandKit(organization_id=context.organization_id)
-        db.add(row)
+        raise HTTPException(status_code=422 if scan_status == "infected" else 503, detail="Document template could not be accepted")
+    try:
+        validation = validate_template_package(data)
+    except TemplateValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    template = await db.scalar(select(OrganizationDocumentTemplate).where(
+        OrganizationDocumentTemplate.organization_id == context.organization_id,
+    ))
+    if not template:
+        template = OrganizationDocumentTemplate(organization_id=context.organization_id, enabled=True)
+        db.add(template)
         await db.flush()
-    if row.logo_storage_key:
-        await storage_service.delete(row.logo_storage_key)
-    key = f"organizations/{context.organization_id}/brand/{row.id}/{file_name}"
-    await storage_service.save_bytes(key, data, upload.content_type)
-    row.logo_storage_key = key
-    row.logo_file_name = file_name
-    row.logo_mime_type = upload.content_type
-    await audit(db, context, "brand_kit.logo_updated", "organization", context.organization_id, {"file_name": file_name, "size_bytes": len(data)})
+    version_number = max((await db.scalars(select(OrganizationDocumentTemplateVersion.version_number).where(
+        OrganizationDocumentTemplateVersion.template_id == template.id,
+    ))).all(), default=0) + 1
+    version = OrganizationDocumentTemplateVersion(
+        organization_id=context.organization_id,
+        template_id=template.id,
+        version_number=version_number,
+        file_name=file_name,
+        mime_type=DOCX_MIME_TYPE,
+        size_bytes=len(data),
+        storage_key=f"organizations/{context.organization_id}/document-templates/{template.id}/v{version_number}/{file_name}",
+        sha256=validation["sha256"],
+        validation_report_json=json.dumps(validation),
+        uploaded_by=context.user_id,
+    )
+    db.add(version)
+    await db.flush()
+    await storage_service.save_bytes(version.storage_key, data, DOCX_MIME_TYPE)
+    job = DocumentTemplateValidationJob(organization_id=context.organization_id, template_version_id=version.id)
+    db.add(job)
+    await audit(db, context, "document_template.uploaded", "document_template_version", version.id, {
+        "version_number": version_number,
+        "file_name": file_name,
+        "size_bytes": len(data),
+        "sha256": version.sha256,
+    })
     await db.commit()
-    return brand_kit_json(row, True)
+    log_event(logger, logging.INFO, "document_template.queued", organization_id=context.organization_id, template_id=template.id, template_version_id=version.id, version_number=version_number, size_bytes=len(data))
+    return await document_template_json(db, template, can_manage=True)
 
 
-@app.get("/v1/organizations/current/brand-kit/logo")
-async def get_brand_logo(context: RequestContext = Depends(get_context), db: AsyncSession = Depends(get_db)) -> Response:
-    row = await db.scalar(select(OrganizationBrandKit).where(OrganizationBrandKit.organization_id == context.organization_id))
-    if not row or not row.logo_storage_key:
-        raise HTTPException(status_code=404, detail="Brand logo not found")
-    return Response(await storage_service.read(row.logo_storage_key), media_type=row.logo_mime_type or "image/png", headers={"Cache-Control": "private, max-age=300"})
+async def scoped_document_template_version(
+    db: AsyncSession,
+    context: RequestContext,
+    version_id: str,
+) -> tuple[OrganizationDocumentTemplate, OrganizationDocumentTemplateVersion]:
+    version = await db.scalar(select(OrganizationDocumentTemplateVersion).where(
+        OrganizationDocumentTemplateVersion.id == version_id,
+        OrganizationDocumentTemplateVersion.organization_id == context.organization_id,
+    ))
+    if not version:
+        raise HTTPException(status_code=404, detail="Document template version not found")
+    template = await db.get(OrganizationDocumentTemplate, version.template_id)
+    if not template or template.organization_id != context.organization_id:
+        raise HTTPException(status_code=404, detail="Document template not found")
+    return template, version
+
+
+@app.get("/v1/organizations/current/document-template/versions/{version_id}/download")
+async def download_document_template(
+    version_id: str,
+    context: RequestContext = Depends(require_role("owner", "admin")),
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    _, version = await scoped_document_template_version(db, context, version_id)
+    return Response(await storage_service.read(version.storage_key), media_type=DOCX_MIME_TYPE, headers={
+        "Content-Disposition": f'attachment; filename="{safe_file_name(version.file_name)}"',
+        "Cache-Control": "private, no-store",
+    })
+
+
+@app.get("/v1/organizations/current/document-template/versions/{version_id}/previews/{preview_number}")
+async def preview_document_template(
+    version_id: str,
+    preview_number: int,
+    context: RequestContext = Depends(get_context),
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    _, version = await scoped_document_template_version(db, context, version_id)
+    preview_keys = json.loads(version.preview_keys_json or "[]")
+    if preview_number < 1 or preview_number > len(preview_keys):
+        raise HTTPException(status_code=404, detail="Document template preview not found")
+    return Response(await storage_service.read(preview_keys[preview_number - 1]), media_type="image/png", headers={"Cache-Control": "private, max-age=300"})
+
+
+@app.post("/v1/organizations/current/document-template/versions/{version_id}/activate")
+async def activate_document_template(
+    version_id: str,
+    context: RequestContext = Depends(require_role("owner", "admin")),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    template, version = await scoped_document_template_version(db, context, version_id)
+    if version.status != "ready":
+        raise HTTPException(status_code=409, detail="Only a validated document template can be activated")
+    template.active_version_id = version.id
+    template.enabled = True
+    version.activated_at = utc_now()
+    await audit(db, context, "document_template.activated", "document_template_version", version.id, {"version_number": version.version_number})
+    await db.commit()
+    return await document_template_json(db, template, can_manage=True)
+
+
+@app.post("/v1/organizations/current/document-template/disable")
+async def disable_document_template(
+    context: RequestContext = Depends(require_role("owner", "admin")),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    template = await db.scalar(select(OrganizationDocumentTemplate).where(
+        OrganizationDocumentTemplate.organization_id == context.organization_id,
+    ))
+    if not template:
+        raise HTTPException(status_code=404, detail="Document template not found")
+    template.enabled = False
+    await audit(db, context, "document_template.disabled", "document_template", template.id)
+    await db.commit()
+    return await document_template_json(db, template, can_manage=True)
 
 
 @app.post("/v1/organizations/current/transfer-ownership")
@@ -843,9 +935,7 @@ async def cleanup_organization(organization_id: str) -> None:
         artifacts = (await db.scalars(select(GeneratedArtifact).where(GeneratedArtifact.organization_id == organization_id))).all()
         for artifact in artifacts:
             await delete_artifact_files(db, storage_service, artifact.id)
-        brand = await db.scalar(select(OrganizationBrandKit).where(OrganizationBrandKit.organization_id == organization_id))
-        if brand and brand.logo_storage_key:
-            await storage_service.delete(brand.logo_storage_key)
+        await delete_document_template_files(db, storage_service, organization_id)
         organization = await db.get(Organization, organization_id)
         if organization:
             await db.delete(organization)
@@ -1813,7 +1903,7 @@ async def stream_message(conversation_id: str, payload: MessageCreate, context: 
                         instructions=payload.content,
                         format_name=artifact_format,
                         template_id=payload.artifact_request.template_id if payload.artifact_request else "auto",
-                        use_brand_kit=payload.artifact_request.use_brand_kit if payload.artifact_request else True,
+                        use_document_template=payload.artifact_request.use_document_template if payload.artifact_request else True,
                         model=model,
                         effort=effort,
                         knowledge_base_ids=knowledge_base_ids,
@@ -2035,6 +2125,25 @@ async def revise_artifact(artifact_id: str, payload: ArtifactRevisionCreate, con
     if current.status != "ready":
         raise HTTPException(status_code=409, detail="Wait for the current version to finish before revising it")
     source_scope = current.source_scope_json or artifact.source_scope_json
+    document_template_version_id = current.document_template_version_id
+    document_template_snapshot_json = current.document_template_snapshot_json or "{}"
+    if payload.use_current_document_template and artifact.format == "docx" and artifact.use_document_template:
+        organization_template = await db.scalar(select(OrganizationDocumentTemplate).where(
+            OrganizationDocumentTemplate.organization_id == context.organization_id,
+            OrganizationDocumentTemplate.enabled.is_(True),
+        ))
+        candidate = await db.get(OrganizationDocumentTemplateVersion, organization_template.active_version_id) if organization_template and organization_template.active_version_id else None
+        if candidate and candidate.status == "ready":
+            document_template_version_id = candidate.id
+            document_template_snapshot_json = json.dumps({
+                "id": candidate.id,
+                "version_number": candidate.version_number,
+                "file_name": candidate.file_name,
+                "sha256": candidate.sha256,
+            })
+        else:
+            document_template_version_id = None
+            document_template_snapshot_json = "{}"
     next_version = max((await db.scalars(select(ArtifactVersion.version_number).where(ArtifactVersion.artifact_id == artifact.id))).all(), default=0) + 1
     version = ArtifactVersion(
         organization_id=context.organization_id,
@@ -2043,6 +2152,8 @@ async def revise_artifact(artifact_id: str, payload: ArtifactRevisionCreate, con
         version_number=next_version,
         instructions=payload.instructions.strip(),
         source_scope_json=source_scope,
+        document_template_version_id=document_template_version_id,
+        document_template_snapshot_json=document_template_snapshot_json,
     )
     db.add(version)
     await db.flush()
@@ -2050,7 +2161,7 @@ async def revise_artifact(artifact_id: str, payload: ArtifactRevisionCreate, con
     artifact.current_version = next_version
     artifact.status = "queued"
     artifact.error = None
-    await audit(db, context, "artifact.revision_queued", "artifact", artifact.id, {"version": next_version})
+    await audit(db, context, "artifact.revision_queued", "artifact", artifact.id, {"version": next_version, "document_template_version_id": document_template_version_id})
     await db.commit()
     log_event(logger, logging.INFO, "artifact.revision_queued", artifact_id=artifact.id, version_id=version.id, version_number=next_version, format=artifact.format)
     return await artifact_json(db, artifact)

@@ -121,7 +121,9 @@ Choose **Create → Document (.docx)** or **Create → Presentation (.pptx)** in
 
 Generation runs in a separate durable worker. The chat card survives refresh and shows planning, rendering, validation, completion, failure, or cancellation. Completed files can be previewed, downloaded, revised into immutable versions, deleted, or explicitly saved into an accessible knowledge base.
 
-Owners/admins configure logo, colors, curated fonts, and footer text under **Settings → Organization brand kit**. Generated files are private to their creator. Downloads and revisions re-check organization membership and current access to every knowledge base used by the file.
+Owners/admins upload one organization-wide Word template under **Settings → Organization document template**. Jules preserves its page geometry, letterhead, headers, footers, styles, numbering, and table styling while discarding sample body content. Upload a single-section `.docx` up to 15 MB; `.dotx`, macros, ActiveX/OLE content, external relationships, and remote templates are rejected. A replacement becomes active only after structural and visual validation, so the previous validated template remains available if validation fails.
+
+Organization templates are used by default for DOCX generation and can be disabled per request in the Create menu. Each artifact version records the exact organization-template version used; revisions inherit it unless the user explicitly selects the currently active template. PPTX files use Jules’ built-in presentation themes. Generated files remain private to their creator, and downloads and revisions re-check organization membership and current access to every knowledge base used by the file.
 
 Local development structurally validates Office files even when LibreOffice is absent. Install LibreOffice and Poppler to enable local page/slide previews and Gemini visual QA. The provided artifact-worker container already includes these tools and bundled fonts.
 

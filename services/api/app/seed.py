@@ -68,7 +68,6 @@ async def seed_development_data(db: AsyncSession) -> None:
         Membership(id="membership-maya", organization_id=org.id, user_id=maya.id, role="admin"),
         Membership(id="membership-jon", organization_id=org.id, user_id=jon.id, role="member"),
         UserSettings(organization_id=org.id, user_id=user.id, custom_instructions="Write for a business audience and make next actions explicit.", web_search_default=True),
-        *(ModelConfiguration(**item) for item in MODEL_CATALOG),
         OrganizationModelPolicy(organization_id=org.id, allowed_models_json=json.dumps([item["id"] for item in MODEL_CATALOG]), default_model=DEFAULT_MODEL_ID, maximum_effort="high"),
     ])
 
@@ -92,3 +91,4 @@ async def seed_development_data(db: AsyncSession) -> None:
         if index == 1:
             db.add(PromptFavorite(organization_id=org.id, prompt_id=prompt.id, user_id=user.id))
     await db.commit()
+    await sync_model_catalog(db)

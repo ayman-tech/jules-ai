@@ -2,29 +2,29 @@ import fs from "node:fs"
 import path from "node:path"
 import pptxgen from "pptxgenjs"
 
-const [specPath, brandPath, citationsPath, destination] = process.argv.slice(2)
-if (!specPath || !brandPath || !citationsPath || !destination) {
-  throw new Error("Usage: render-pptx.mjs <spec.json> <brand.json> <citations.json> <output.pptx>")
+const [specPath, themePath, citationsPath, destination] = process.argv.slice(2)
+if (!specPath || !themePath || !citationsPath || !destination) {
+  throw new Error("Usage: render-pptx.mjs <spec.json> <theme.json> <citations.json> <output.pptx>")
 }
 
 const spec = JSON.parse(fs.readFileSync(specPath, "utf8"))
-const brand = JSON.parse(fs.readFileSync(brandPath, "utf8"))
+const theme = JSON.parse(fs.readFileSync(themePath, "utf8"))
 const citations = JSON.parse(fs.readFileSync(citationsPath, "utf8"))
 const cleanHex = (value, fallback) => /^#[0-9a-f]{6}$/i.test(value ?? "") ? value.slice(1).toUpperCase() : fallback
-const primary = cleanHex(brand.primary_color, "4C1D95")
-const accent = cleanHex(brand.accent_color, "7C3AED")
+const primary = cleanHex(theme.primary_color, "312E81")
+const accent = cleanHex(theme.accent_color, "6D28D9")
 const ink = "17151C"
 const muted = "66616F"
 const pale = "F3F0F8"
-const headingFont = brand.heading_font || "Aptos Display"
-const bodyFont = brand.body_font || "Aptos"
+const headingFont = theme.heading_font || "Aptos Display"
+const bodyFont = theme.body_font || "Aptos"
 
 const pptx = new pptxgen()
 pptx.layout = "LAYOUT_WIDE"
 pptx.author = "Jules AI"
 pptx.subject = spec.subtitle || spec.title
 pptx.title = spec.title
-pptx.company = brand.footer_text || ""
+pptx.company = ""
 pptx.lang = "en-US"
 pptx.theme = {
   headFontFace: headingFont,
@@ -36,23 +36,16 @@ pptx.defineSlideMaster({
   background: { color: "FCFBFD" },
   objects: [
     { line: { x: 0.55, y: 7.12, w: 12.23, h: 0, line: { color: "DDD7E8", width: 1 } } },
-    { text: { text: brand.footer_text || "Jules AI", options: { x: 0.62, y: 7.18, w: 5.5, h: 0.16, fontFace: bodyFont, fontSize: 8, color: muted, margin: 0 } } },
+    { text: { text: "Jules AI", options: { x: 0.62, y: 7.18, w: 5.5, h: 0.16, fontFace: bodyFont, fontSize: 8, color: muted, margin: 0 } } },
     { text: { text: "{{slideNum}}", options: { x: 12.1, y: 7.18, w: 0.6, h: 0.16, align: "right", fontFace: bodyFont, fontSize: 8, color: muted, margin: 0 } } },
   ],
   slideNumber: { x: 12.1, y: 7.16, color: muted, fontFace: bodyFont, fontSize: 8 },
 })
 
-function addLogo(slide) {
-  if (brand.logo_path && fs.existsSync(brand.logo_path)) {
-    slide.addImage({ path: brand.logo_path, x: 11.25, y: 0.35, w: 1.35, h: 0.55 })
-  }
-}
-
 function addTitle(slide, title, subtitle = "") {
   slide.addText(title, { x: 0.72, y: 0.55, w: 10.15, h: 0.55, fontFace: headingFont, fontSize: 35, bold: true, color: ink, margin: 0, breakLine: false, fit: "shrink" })
   slide.addShape(pptx.ShapeType.line, { x: 0.72, y: 1.23, w: 1.15, h: 0, line: { color: accent, width: 4 } })
   if (subtitle) slide.addText(subtitle, { x: 2.05, y: 1.08, w: 8.8, h: 0.28, fontFace: bodyFont, fontSize: 14, color: muted, margin: 0, fit: "shrink" })
-  addLogo(slide)
 }
 
 function addBlock(slide, block, y, height) {
@@ -95,7 +88,6 @@ titleSlide.addShape(pptx.ShapeType.line, { x: 0.82, y: 1.15, w: 1.25, h: 0, line
 titleSlide.addText(spec.title, { x: 0.82, y: 1.5, w: 10.6, h: 1.55, fontFace: headingFont, fontSize: 50, bold: true, color: "FFFFFF", margin: 0, fit: "shrink", valign: "mid" })
 if (spec.subtitle) titleSlide.addText(spec.subtitle, { x: 0.84, y: 3.25, w: 9.8, h: 0.75, fontFace: bodyFont, fontSize: 24, color: "E9E1F5", margin: 0, fit: "shrink" })
 titleSlide.addText(spec.audience || "", { x: 0.84, y: 6.45, w: 7.5, h: 0.28, fontFace: bodyFont, fontSize: 12, color: "D9CFEB", margin: 0 })
-addLogo(titleSlide)
 
 for (const page of spec.pages) {
   const slide = pptx.addSlide("JULES_BASE")
