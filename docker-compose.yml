@@ -1,0 +1,92 @@
+services:
+  db:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_DB: jules_ai
+      POSTGRES_USER: jules_ai
+      POSTGRES_PASSWORD: jules_ai
+    ports:
+      - "5432:5432"
+    volumes:
+      - jules_ai_postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U jules_ai"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: services/api/Dockerfile
+    environment:
+      APP_ENV: development
+      AUTH_MODE: development
+      DATABASE_URL: postgresql+asyncpg://jules_ai:jules_ai@db:5432/jules_ai
+      CORS_ORIGINS: http://localhost:3000,http://127.0.0.1:3000
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+      GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT:-}
+      GOOGLE_CLOUD_STORAGE_BUCKET: ${GOOGLE_CLOUD_STORAGE_BUCKET:-}
+      DOCUMENT_AI_PROCESSOR_NAME: ${DOCUMENT_AI_PROCESSOR_NAME:-}
+    ports:
+      - "8000:8000"
+    volumes:
+      - jules_ai_uploads:/app/uploads
+    depends_on:
+      db:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: .
+      dockerfile: services/api/Dockerfile
+    command: ["python", "-m", "app.knowledge_worker"]
+    environment:
+      APP_ENV: development
+      AUTH_MODE: development
+      DATABASE_URL: postgresql+asyncpg://jules_ai:jules_ai@db:5432/jules_ai
+      CORS_ORIGINS: http://localhost:3000,http://127.0.0.1:3000
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+      GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT:-}
+      GOOGLE_CLOUD_STORAGE_BUCKET: ${GOOGLE_CLOUD_STORAGE_BUCKET:-}
+      DOCUMENT_AI_PROCESSOR_NAME: ${DOCUMENT_AI_PROCESSOR_NAME:-}
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - jules_ai_uploads:/app/uploads
+
+  artifact-worker:
+    build:
+      context: .
+      dockerfile: services/api/Dockerfile
+    command: ["python", "-m", "app.artifact_worker"]
+    environment:
+      APP_ENV: development
+      AUTH_MODE: development
+      DATABASE_URL: postgresql+asyncpg://jules_ai:jules_ai@db:5432/jules_ai
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+      GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT:-}
+      GOOGLE_CLOUD_STORAGE_BUCKET: ${GOOGLE_CLOUD_STORAGE_BUCKET:-}
+      ARTIFACT_GENERATION_ENABLED: ${ARTIFACT_GENERATION_ENABLED:-true}
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - jules_ai_uploads:/app/uploads
+
+  web:
+    build:
+      context: ./apps/web
+      args:
+        NEXT_PUBLIC_API_URL: http://localhost:8000/v1
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000/v1
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api
+
+volumes:
+  jules_ai_postgres:
+  jules_ai_uploads:
