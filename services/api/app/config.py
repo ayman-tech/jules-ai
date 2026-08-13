@@ -36,6 +36,9 @@ class Settings(BaseSettings):
     artifact_max_bytes: int = 50 * 1024 * 1024
     artifact_qa_retry_count: int = 2
     artifact_render_timeout_seconds: int = 120
+    enhanced_research_documents: bool = True
+    artifact_research_max_queries: int = 8
+    artifact_research_concurrency: int = 4
     document_template_max_bytes: int = 15 * 1024 * 1024
 
     @property

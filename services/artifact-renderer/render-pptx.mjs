@@ -55,6 +55,32 @@ function addBlock(slide, block, y, height) {
     cursor += 0.46
   }
   const available = Math.max(0.55, height - (cursor - y))
+  if (block.kind === "chart" && block.categories?.length && block.series?.length && block.source_ordinals?.length) {
+    const valid = block.series.every((series) => Array.isArray(series.values) && series.values.length === block.categories.length)
+    if (valid) {
+      const chartData = block.series.map((series) => ({ name: series.name || "Value", labels: block.categories, values: series.values }))
+      const chartType = block.chart_type === "line" ? pptx.ChartType.line : pptx.ChartType.bar
+      const chartHeight = Math.max(1.5, available * 0.68)
+      slide.addChart(chartType, chartData, {
+        x: 0.85, y: cursor, w: 11.45, h: chartHeight,
+        catAxisLabelFontFace: bodyFont, catAxisLabelFontSize: 10,
+        valAxisLabelFontFace: bodyFont, valAxisLabelFontSize: 10,
+        valAxisTitle: block.unit || "", showValue: false, showLegend: block.series.length > 1,
+        showTitle: false, showCatName: false, showValAxisTitle: Boolean(block.unit),
+        chartColors: [accent, primary, "7C3AED", "2563EB", "059669", "D97706"],
+        showValue: false, showCategoryName: false, showSeriesName: false,
+        showGridLines: true, showBorder: false, legendPos: "b",
+        barDir: "col", grouping: "clustered",
+      })
+      const sourceText = `${block.period ? `${block.period}. ` : ""}Sources: ${block.source_ordinals.map((item) => `[${item}]`).join(", ")}`
+      slide.addText(sourceText, { x: 0.88, y: cursor + chartHeight + 0.03, w: 11.35, h: 0.2, fontFace: bodyFont, fontSize: 9, italic: true, color: muted, margin: 0 })
+      const tableRows = [["Category", ...block.series.map((series) => series.name || "Value")], ...block.categories.map((category, index) => [category, ...block.series.map((series) => String(series.values[index]))])]
+      const tableY = cursor + chartHeight + 0.3
+      const tableHeight = Math.max(0.5, available - chartHeight - 0.3)
+      slide.addTable(tableRows, { x: 0.88, y: tableY, w: 11.35, h: tableHeight, border: { color: "D7D0E2", pt: 0.7 }, fontFace: bodyFont, fontSize: 8, margin: 0.03, autoFit: false, fill: "FFFFFF", color: ink })
+      return
+    }
+  }
   if (block.kind === "table" && block.headers?.length) {
     const rows = [block.headers, ...(block.rows || [])]
     slide.addTable(rows, {
@@ -105,7 +131,13 @@ for (const page of spec.pages) {
 if (citations.length) {
   const slide = pptx.addSlide("JULES_BASE")
   addTitle(slide, "Sources")
-  const sourceText = citations.slice(0, 18).map((item) => ({ text: `[${item.ordinal}] ${item.title}${item.publisher ? ` — ${item.publisher}` : ""}\n${item.location || item.url || ""}`, options: { breakLine: true } }))
+  const sourceText = citations.slice(0, 18).flatMap((item) => {
+    const heading = { text: `[${item.ordinal}] ${item.title}${item.publisher ? ` — ${item.publisher}` : ""}\n`, options: { breakLine: false, hyperlink: item.url ? { url: item.url } : undefined, color: item.url ? accent : ink, underline: Boolean(item.url) } }
+    const destination = item.location || item.url || ""
+    const accessed = item.retrieved_at ? ` — accessed ${String(item.retrieved_at).slice(0, 10)}` : ""
+    const detail = { text: `${destination}${accessed}`, options: { breakLine: true, hyperlink: item.url ? { url: item.url } : undefined, color: item.url ? accent : ink, underline: Boolean(item.url) } }
+    return [heading, detail]
+  })
   slide.addText(sourceText, { x: 0.82, y: 1.62, w: 11.45, h: 5.25, fontFace: bodyFont, fontSize: 13, color: ink, margin: 0, paraSpaceAfterPt: 7, fit: "shrink", valign: "top" })
   if (typeof slide.addNotes === "function") slide.addNotes(`[Sources]\n${citations.map((item) => `[${item.ordinal}] ${item.title} - ${item.location || item.url || ""}`).join("\n")}`)
 }

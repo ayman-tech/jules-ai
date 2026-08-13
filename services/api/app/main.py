@@ -1820,6 +1820,7 @@ async def stream_message(conversation_id: str, payload: MessageCreate, context: 
         history=history_context,
         private_memory=private_memory,
         internal_context=internal_context if knowledge_base_ids else "",
+        internal_citation_count=len(internal_citations),
         web_search_enabled=web_search_enabled,
     )
 

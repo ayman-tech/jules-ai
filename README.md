@@ -133,6 +133,8 @@ Web search starts from each user’s Settings preference and can be changed in t
 
 Company sources define company policy and decisions. Public evidence supplements them and never overrides them automatically. A disagreement is presented as Company position versus Current external evidence.
 
+Chat and generated artifacts use one visible citation sequence (`[1]`, `[2]`, …) across company and web evidence. Source type remains structured metadata for the grouped source cards. Comprehensive DOCX requests use the deep-research pipeline: a bounded research plan, primary-source preferences, content QA, and one corrective drafting pass. Generated research documents include linked sources, document metadata, an updateable contents field, and cited chart data. Set `ENHANCED_RESEARCH_DOCUMENTS=false` to return artifact planning to the standard profile without changing existing files.
+
 ## Optional GCS and Document AI
 
 Local development does not require these services. To exercise cloud storage/layout parsing locally, configure:

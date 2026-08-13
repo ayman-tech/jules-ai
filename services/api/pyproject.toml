@@ -12,7 +12,10 @@ dependencies = [
   "google-adk>=2.0.0,<3.0.0",
   "google-cloud-storage>=2.19.0",
   "google-cloud-documentai>=3.6.0",
+  "httpx>=0.28.0",
+  "matplotlib>=3.9.0",
   "openpyxl>=3.1.5",
+  "pillow>=11.0.0",
   "pgvector>=0.3.6",
   "pypdf>=5.4.0",
   "pydantic-settings>=2.7.0",
@@ -25,7 +28,6 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-  "httpx>=0.28.0",
   "pytest>=8.3.0",
   "pytest-asyncio>=0.25.0"
 ]
