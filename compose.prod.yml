@@ -1,0 +1,115 @@
+name: jules-ai
+
+x-api-environment: &api-environment
+  APP_ENV: production
+  AUTH_MODE: firebase
+  DATABASE_URL: postgresql+asyncpg://jules_ai:${POSTGRES_PASSWORD}@db:5432/jules_ai
+  CORS_ORIGINS: https://${APP_DOMAIN}
+  FIREBASE_PROJECT_ID: ${FIREBASE_PROJECT_ID}
+  GOOGLE_APPLICATION_CREDENTIALS: /run/secrets/firebase-service-account.json
+  GOOGLE_API_KEY: ${GOOGLE_API_KEY}
+  GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.5-flash}
+  EMBEDDING_MODEL: ${EMBEDDING_MODEL:-gemini-embedding-2}
+  GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT:-}
+  GOOGLE_CLOUD_STORAGE_BUCKET: ${GOOGLE_CLOUD_STORAGE_BUCKET:-}
+  DOCUMENT_AI_PROCESSOR_NAME: ${DOCUMENT_AI_PROCESSOR_NAME:-}
+  LOCAL_UPLOAD_DIR: /app/uploads
+  LOG_LEVEL: INFO
+  LOG_DIR: /app/logs
+  LOG_CHAT_TRANSCRIPTS: "false"
+  ARTIFACT_GENERATION_ENABLED: ${ARTIFACT_GENERATION_ENABLED:-true}
+  ENHANCED_RESEARCH_DOCUMENTS: ${ENHANCED_RESEARCH_DOCUMENTS:-true}
+
+x-api-volumes: &api-volumes
+  - jules_uploads:/app/uploads
+  - jules_logs:/app/logs
+  - /home/ubuntu/jules-secrets/firebase-service-account.json:/run/secrets/firebase-service-account.json:ro
+
+services:
+  db:
+    image: pgvector/pgvector:pg17
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: jules_ai
+      POSTGRES_USER: jules_ai
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - jules_postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U jules_ai -d jules_ai"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  api:
+    build:
+      context: .
+      dockerfile: services/api/Dockerfile
+    restart: unless-stopped
+    environment: *api-environment
+    volumes: *api-volumes
+    ports:
+      - "127.0.0.1:18000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  worker:
+    build:
+      context: .
+      dockerfile: services/api/Dockerfile
+    command: ["python", "-m", "app.knowledge_worker"]
+    restart: unless-stopped
+    environment: *api-environment
+    volumes: *api-volumes
+    depends_on:
+      api:
+        condition: service_healthy
+
+  artifact-worker:
+    build:
+      context: .
+      dockerfile: services/api/Dockerfile
+    command: ["python", "-m", "app.artifact_worker"]
+    restart: unless-stopped
+    environment: *api-environment
+    volumes: *api-volumes
+    depends_on:
+      api:
+        condition: service_healthy
+
+  web:
+    build:
+      context: ./apps/web
+      args:
+        NEXT_PUBLIC_API_URL: https://${APP_DOMAIN}/v1
+        NEXT_PUBLIC_AUTH_MODE: firebase
+        NEXT_PUBLIC_FIREBASE_API_KEY: ${NEXT_PUBLIC_FIREBASE_API_KEY}
+        NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN: ${NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN}
+        NEXT_PUBLIC_FIREBASE_PROJECT_ID: ${NEXT_PUBLIC_FIREBASE_PROJECT_ID}
+        NEXT_PUBLIC_FIREBASE_APP_ID: ${NEXT_PUBLIC_FIREBASE_APP_ID}
+    restart: unless-stopped
+    environment:
+      NEXT_PUBLIC_API_URL: https://${APP_DOMAIN}/v1
+      NEXT_PUBLIC_AUTH_MODE: firebase
+    ports:
+      - "127.0.0.1:13000:3000"
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  jules_postgres:
+  jules_uploads:
+  jules_logs:
