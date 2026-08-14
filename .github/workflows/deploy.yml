@@ -1,0 +1,103 @@
+name: Deploy production
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run lint:web
+      - run: npm run build:web
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: latest
+          enable-cache: true
+      - working-directory: services/api
+        run: uv sync --extra dev --locked
+      - working-directory: services/api
+        run: uv run pytest -q
+
+  deploy:
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    environment: production
+    env:
+      VM_HOST: ${{ secrets.VM_HOST }}
+      SSH_PRIVATE_KEY: ${{ secrets.VM_SSH_PRIVATE_KEY }}
+      SSH_KNOWN_HOSTS: ${{ secrets.VM_KNOWN_HOSTS }}
+    steps:
+      - name: Configure SSH
+        shell: bash
+        run: |
+          set -euo pipefail
+          install -m 700 -d "$HOME/.ssh"
+          printf '%s\n' "$SSH_PRIVATE_KEY" > "$HOME/.ssh/id_ed25519"
+          chmod 600 "$HOME/.ssh/id_ed25519"
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+
+      - name: Deploy main to VM
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh \
+            -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes \
+            -i "$HOME/.ssh/id_ed25519" \
+            "aymansayedx@$VM_HOST" 'bash -se' <<'REMOTE'
+          set -euo pipefail
+
+          cd /home/aymansayedx/jules-ai
+          test -f /home/aymansayedx/jules-config/app.env
+          test -f compose.prod.yml
+
+          git fetch --prune origin main
+          git checkout main
+          git merge --ff-only origin/main
+
+          docker compose \
+            --env-file /home/aymansayedx/jules-config/app.env \
+            -f compose.prod.yml \
+            up -d --build --remove-orphans
+
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent --show-error http://127.0.0.1:18000/health; then
+              echo
+              docker compose \
+                --env-file /home/aymansayedx/jules-config/app.env \
+                -f compose.prod.yml \
+                ps
+              exit 0
+            fi
+            echo "Waiting for API health check ($attempt/30)..."
+            sleep 10
+          done
+
+          docker compose \
+            --env-file /home/aymansayedx/jules-config/app.env \
+            -f compose.prod.yml \
+            ps
+          docker compose \
+            --env-file /home/aymansayedx/jules-config/app.env \
+            -f compose.prod.yml \
+            logs --tail=200 api
+          exit 1
+          REMOTE
