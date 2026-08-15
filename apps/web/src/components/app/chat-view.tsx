@@ -165,7 +165,7 @@ function AssistantActivity({ label }: { label: string }) {
   </div>
 }
 
-function ArtifactCard({ artifact, organizationId, knowledgeBases, onUpdated, onDeleted }: { artifact: Artifact; organizationId: string; knowledgeBases: KnowledgeBase[]; onUpdated: (artifact: Artifact) => void; onDeleted: (artifactId: string) => void }) {
+export function ArtifactCard({ artifact, organizationId, knowledgeBases, onUpdated, onDeleted }: { artifact: Artifact; organizationId: string; knowledgeBases: KnowledgeBase[]; onUpdated: (artifact: Artifact) => void; onDeleted: (artifactId: string) => void }) {
   const [previewOpen, setPreviewOpen] = useState(false)
   const [previewUrls, setPreviewUrls] = useState<string[]>([])
   const [previewLoading, setPreviewLoading] = useState(false)
@@ -175,12 +175,54 @@ function ArtifactCard({ artifact, organizationId, knowledgeBases, onUpdated, onD
   const [saveOpen, setSaveOpen] = useState(false)
   const [knowledgeBaseId, setKnowledgeBaseId] = useState(knowledgeBases[0]?.id ?? "")
   const [selectedVersionOverride, setSelectedVersionOverride] = useState<number | null>(null)
+  const onUpdatedRef = useRef(onUpdated)
   const selectedVersion = selectedVersionOverride ?? artifact.current_version
   const version = artifact.versions.find((item) => item.version_number === selectedVersion) ?? artifact.version
   const working = ["queued", "planning", "rendering", "validating"].includes(artifact.status)
   const statusLabel = artifact.status === "queued" ? "Queued" : artifact.status === "planning" ? "Planning content" : artifact.status === "rendering" ? "Building file" : artifact.status === "validating" ? "Validating layout" : artifact.status === "ready" ? "Ready" : artifact.status === "failed" ? "Failed" : "Cancelled"
 
   useEffect(() => () => { previewUrls.forEach((url) => URL.revokeObjectURL(url)) }, [previewUrls])
+
+  useEffect(() => { onUpdatedRef.current = onUpdated }, [onUpdated])
+
+  useEffect(() => {
+    if (!working) return
+    let cancelled = false
+    let timeout: number | undefined
+    let consecutiveFailures = 0
+    const deadline = Date.now() + 20 * 60 * 1000
+
+    async function poll() {
+      if (cancelled || Date.now() >= deadline) return
+      try {
+        const next = await julesApi.artifact(organizationId, artifact.id)
+        if (cancelled) return
+        consecutiveFailures = 0
+        onUpdatedRef.current(next)
+        if (next.status === "ready") {
+          toast.success(`${next.format.toUpperCase()} file is ready`, {
+            action: {
+              label: "Show file",
+              onClick: () => document.getElementById(`artifact-${next.id}`)?.scrollIntoView({ behavior: "smooth", block: "center" }),
+            },
+          })
+          return
+        }
+        if (next.status === "failed") {
+          toast.error(next.error || "File generation failed")
+          return
+        }
+        if (next.status === "cancelled") return
+      } catch {
+        consecutiveFailures += 1
+      }
+      const delay = Math.min(10_000, 2_000 * 2 ** consecutiveFailures)
+      timeout = window.setTimeout(() => void poll(), delay)
+    }
+
+    timeout = window.setTimeout(() => void poll(), 2_000)
+    return () => { cancelled = true; if (timeout !== undefined) window.clearTimeout(timeout) }
+  }, [artifact.id, organizationId, working])
 
   async function download() {
     if (!version) return

@@ -1,6 +1,6 @@
 "use client"
 
-import { useEffect, useMemo, useRef, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { toast } from "sonner"
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet"
 import { AppSidebar } from "@/components/app/app-sidebar"
@@ -11,6 +11,7 @@ import { OrganizationView } from "@/components/app/organization-view"
 import { OrganizationAccessDialog } from "@/components/organizations/organization-access-dialog"
 import { PromptLibrary } from "@/components/app/prompt-library"
 import { SettingsView } from "@/components/app/settings-view"
+import { reconcileConversationMessages } from "@/lib/conversation-state"
 import { julesApi } from "@/lib/api"
 import { demoAuditEvents, demoConversations, demoInvitations, demoKnowledgeBases, demoKnowledgeReview, demoMembers, demoMessages, demoModels, demoOrganizations, demoPrompts, demoSettings, demoUser } from "@/lib/demo-data"
 import type { Artifact, ArtifactRequest, Attachment, Citation, Conversation, DocumentTemplateVersion, Effort, Invitation, KnowledgeBase, Message, Organization, OrganizationDocumentTemplate, Prompt, PromptVersion, UserSettings, View } from "@/lib/types"
@@ -56,9 +57,7 @@ export function JulesApp(props: JulesAppProps = {}) {
   const [artifactRequest, setArtifactRequest] = useState<ArtifactRequest | undefined>()
   const backendConnected = useRef(false)
   const streamController = useRef<AbortController | null>(null)
-  const activeOrganizationRef = useRef(activeOrganizationId)
-
-  useEffect(() => { activeOrganizationRef.current = activeOrganizationId }, [activeOrganizationId])
+  const preserveFailedConversation = useRef<string | null>(null)
 
   useEffect(() => {
     let cancelled = false
@@ -95,12 +94,23 @@ export function JulesApp(props: JulesAppProps = {}) {
   }, [activeOrganizationId, documentTemplate.pending_version?.id, documentTemplate.pending_version?.status])
 
   useEffect(() => {
-    if (!backendConnected.current || !activeConversationId) return
+    if (!backendConnected.current || !activeConversationId || streaming) return
+    let cancelled = false
+    const conversationId = activeConversationId
     julesApi.conversation(activeOrganizationId, activeConversationId).then((conversation) => {
-      setMessages((current) => ({ ...current, [activeConversationId]: conversation.messages }))
+      if (cancelled) return
+      setMessages((current) => {
+        const preserveAfterFailure = preserveFailedConversation.current === conversationId
+        if (preserveAfterFailure) {
+          preserveFailedConversation.current = null
+        }
+        const reconciled = reconcileConversationMessages(current[conversationId] ?? [], conversation.messages, preserveAfterFailure)
+        return reconciled === current[conversationId] ? current : { ...current, [conversationId]: reconciled }
+      })
       setModel(conversation.model); setEffort(conversation.effort); setSelectedKnowledgeBaseIds(conversation.knowledge_base_ids); setWebSearchEnabled(conversation.web_search_enabled)
     }).catch(() => undefined)
-  }, [activeConversationId, activeOrganizationId])
+    return () => { cancelled = true }
+  }, [activeConversationId, activeOrganizationId, streaming])
 
   useEffect(() => {
     if (!backendConnected.current || !activeKnowledgeBaseId) { setActiveKnowledgeBase(knowledgeBases.find((item) => item.id === activeKnowledgeBaseId)); return }
@@ -172,7 +182,7 @@ export function JulesApp(props: JulesAppProps = {}) {
     }
   }
 
-  function updateArtifactInMessages(nextArtifact: Artifact) {
+  const updateArtifactInMessages = useCallback((nextArtifact: Artifact) => {
     setMessages((current) => {
       const next = { ...current }
       let attached = false
@@ -198,31 +208,10 @@ export function JulesApp(props: JulesAppProps = {}) {
       }
       return next
     })
-  }
+  }, [])
 
   function removeArtifactFromMessages(artifactId: string) {
     setMessages((current) => Object.fromEntries(Object.entries(current).map(([conversationId, rows]) => [conversationId, rows.map((message) => ({ ...message, artifacts: message.artifacts?.filter((item) => item.id !== artifactId) }))])))
-  }
-
-  async function watchArtifact(organizationId: string, artifactId: string) {
-    for (let attempt = 0; attempt < 600; attempt += 1) {
-      await new Promise((resolve) => window.setTimeout(resolve, 2000))
-      if (activeOrganizationRef.current !== organizationId) return
-      try {
-        const next = await julesApi.artifact(organizationId, artifactId)
-        updateArtifactInMessages(next)
-        if (["ready", "failed", "cancelled"].includes(next.status)) {
-          if (next.status === "ready") toast.success(`${next.format.toUpperCase()} file is ready`, {
-            action: {
-              label: "Show file",
-              onClick: () => document.getElementById(`artifact-${next.id}`)?.scrollIntoView({ behavior: "smooth", block: "center" }),
-            },
-          })
-          if (next.status === "failed") toast.error(next.error || "File generation failed")
-          return
-        }
-      } catch { return }
-    }
   }
 
   async function sendMessage(override?: string) {
@@ -277,13 +266,16 @@ export function JulesApp(props: JulesAppProps = {}) {
         } else if (event === "artifact_queued" && data.artifact && typeof data.artifact === "object") {
           const artifact = data.artifact as unknown as Artifact
           setMessages((current) => ({ ...current, [conversationId]: (current[conversationId] ?? []).map((item) => item.id === assistantId ? { ...item, artifacts: [...(item.artifacts ?? []), artifact] } : item) }))
-          void watchArtifact(activeOrganizationId, artifact.id)
         }
       }, controller.signal)
       setConversations((current) => current.map((item) => item.id === conversationId ? { ...item, knowledge_base_ids: activeKnowledgeBaseIds, web_search_enabled: webSearchEnabled } : item))
       setMessages((current) => ({ ...current, [conversationId]: (current[conversationId] ?? []).map((item) => item.id === assistantId ? { ...item, status: "completed" } : item) }))
     } catch (error) {
-      if ((error as Error).name !== "AbortError") { setMessages((current) => ({ ...current, [conversationId]: (current[conversationId] ?? []).map((item) => item.id === assistantId ? { ...item, status: "error", content: item.content || "Jules AI could not complete that response. Please try again." } : item) })); toast.error("The response was interrupted.") }
+      if ((error as Error).name !== "AbortError") {
+        preserveFailedConversation.current = conversationId
+        setMessages((current) => ({ ...current, [conversationId]: (current[conversationId] ?? []).map((item) => item.id === assistantId ? { ...item, status: "error", content: item.content || "Jules AI could not complete that response. Please try again." } : item) }))
+        toast.error("The response was interrupted.")
+      }
     } finally { setStreaming(false); streamController.current = null }
   }
 
@@ -360,10 +352,9 @@ export function JulesApp(props: JulesAppProps = {}) {
     } catch (error) { toast.error(error instanceof Error ? error.message : "Document template could not be downloaded.") }
   }
 
-  function artifactUpdated(artifact: Artifact) {
+  const artifactUpdated = useCallback((artifact: Artifact) => {
     updateArtifactInMessages(artifact)
-    if (!["ready", "failed", "cancelled"].includes(artifact.status)) void watchArtifact(activeOrganizationId, artifact.id)
-  }
+  }, [updateArtifactInMessages])
 
   function changeKnowledgeScope(ids: string[]) {
     setSelectedKnowledgeBaseIds(ids)

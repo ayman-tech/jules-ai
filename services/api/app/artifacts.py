@@ -148,6 +148,7 @@ class PlanningResult:
     research_duration_ms: float = 0
     quality_retry_count: int = 0
     invalid_citation_count: int = 0
+    quality_issues: tuple[str, ...] = ()
 
 
 def detect_requested_format(content: str) -> str | None:
@@ -570,6 +571,7 @@ Original research request (use this to preserve scope during revisions):
             )
             spec = await generate(correction_prompt, include_attachments=False)
             spec, invalid = normalize_spec_citations(spec, company_count=internal_citation_count, web_count=len(web_citations))
+            invalid_citation_count = len(invalid)
             issues = content_quality_issues(
                 spec,
                 instructions=research_request,
@@ -577,17 +579,22 @@ Original research request (use this to preserve scope during revisions):
                 invalid_markers=invalid,
                 research_plan=research_plan,
             )
-        if issues and profile == "deep-research":
-            raise RuntimeError("Content validation failed: " + "; ".join(issues[:8]))
     except Exception as exc:
-        if isinstance(exc, RuntimeError) and str(exc).startswith("Content validation failed"):
-            raise
         log_event(logger, logging.WARNING, "artifact.plan_invalid", format=format_name, error_type=type(exc).__name__)
         spec = _fallback_spec(format_name, instructions, template_id, previous_spec)
         spec.profile = profile
         quality_retry_count = 0
         invalid_citation_count = 0
-    return PlanningResult(spec, tuple(indexed_web), profile, research_duration_ms, quality_retry_count, invalid_citation_count)
+        issues = []
+    return PlanningResult(
+        spec=spec,
+        web_citations=tuple(indexed_web),
+        profile=profile,
+        research_duration_ms=research_duration_ms,
+        quality_retry_count=quality_retry_count,
+        invalid_citation_count=invalid_citation_count,
+        quality_issues=tuple(issues),
+    )
 
 
 def _hex(value: str, fallback: str) -> str:
@@ -1222,6 +1229,7 @@ async def process_artifact_job(db: AsyncSession, storage: StorageService, job: A
                 result.research_duration_ms,
                 result.quality_retry_count,
                 result.invalid_citation_count,
+                result.quality_issues,
             )
             result.spec.pages = result.spec.pages[:max_content_pages]
             version.content_spec_json = result.spec.model_dump_json()

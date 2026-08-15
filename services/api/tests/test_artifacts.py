@@ -1,11 +1,13 @@
+import json
 import zipfile
 from types import SimpleNamespace
 
 import httpx
 import pytest
 
+from app import artifacts as artifacts_module
 from app import research as research_module
-from app.artifacts import ArtifactBlock, ArtifactPage, ArtifactSpec, content_quality_issues, render_docx, render_pptx
+from app.artifacts import ArtifactBlock, ArtifactPage, ArtifactSpec, content_quality_issues, plan_artifact, render_docx, render_pptx
 from app.research import ChartSeries, CitationStreamNormalizer, artifact_profile, build_evidence_registry, normalize_citations
 
 
@@ -48,6 +50,49 @@ def test_deep_research_content_gate_rejects_shallow_market_overview():
     assert any("seven substantive sections" in issue for issue in issues)
     assert any("TAM/SAM/SOM" in issue for issue in issues)
     assert any("chart" in issue for issue in issues)
+
+
+@pytest.mark.asyncio
+async def test_deep_research_quality_issues_are_non_fatal_after_one_correction(monkeypatch):
+    shallow = json.dumps({
+        "title": "Ashwagandha market overview",
+        "pages": [{"title": "Overview", "blocks": [{"text": "A directional estimate is available [99]."}]}],
+    })
+
+    class FakeModels:
+        def __init__(self):
+            self.calls = 0
+
+        async def generate_content(self, **_kwargs):
+            self.calls += 1
+            return SimpleNamespace(text=shallow)
+
+    fake_models = FakeModels()
+    fake_client = SimpleNamespace(aio=SimpleNamespace(models=fake_models))
+    monkeypatch.setattr(artifacts_module.settings, "google_api_key", "test-key")
+
+    from google import genai
+    monkeypatch.setattr(genai, "Client", lambda **_kwargs: fake_client)
+
+    result = await plan_artifact(
+        format_name="docx",
+        model="gemini-test",
+        effort="high",
+        instructions="Create market research for an ashwagandha supplement",
+        research_request=None,
+        template_id="general-document",
+        internal_context="",
+        web_search_enabled=False,
+        attachment_payloads=(),
+        previous_spec=None,
+    )
+
+    assert fake_models.calls == 2
+    assert result.profile == "deep-research"
+    assert result.quality_retry_count == 1
+    assert result.quality_issues
+    assert result.invalid_citation_count == 1
+    assert "[99]" not in result.spec.pages[0].blocks[0].text
 
 
 @pytest.mark.asyncio
