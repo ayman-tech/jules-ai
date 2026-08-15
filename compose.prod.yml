@@ -23,7 +23,7 @@ x-api-environment: &api-environment
 x-api-volumes: &api-volumes
   - jules_uploads:/app/uploads
   - jules_logs:/app/logs
-  - /home/ubuntu/jules-secrets/firebase-service-account.json:/run/secrets/firebase-service-account.json:ro
+  - /home/aymansayedx/jules-secrets/firebase-service-account.json:/run/secrets/firebase-service-account.json:ro
 
 services:
   db:
