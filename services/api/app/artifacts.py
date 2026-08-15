@@ -151,6 +151,10 @@ class PlanningResult:
     quality_issues: tuple[str, ...] = ()
 
 
+def should_retry_visual_qa(result: VisualQaResult, attempt: int, retry_count: int) -> bool:
+    return not result.passed and attempt < retry_count
+
+
 def detect_requested_format(content: str) -> str | None:
     value = content.lower()
     if re.search(r"\b(pdf)\b", value) and re.search(r"\b(create|make|generate|build|export|write)\b", value):
@@ -1205,10 +1209,11 @@ async def process_artifact_job(db: AsyncSession, storage: StorageService, job: A
             if artifact.format == "docx":
                 qa["layout"] = await asyncio.to_thread(preview_layout_qa, preview_paths)
             visual_result = await visual_qa(str(scope.get("model") or settings.gemini_model), preview_paths)
-            if visual_result.passed:
+            if not should_retry_visual_qa(visual_result, qa_attempt, settings.artifact_qa_retry_count):
+                # The file has already passed structural QA and rendered into previews.
+                # Visual feedback may improve a retry, but it must not discard an
+                # otherwise usable artifact after the retry budget is exhausted.
                 break
-            if qa_attempt >= settings.artifact_qa_retry_count:
-                raise RuntimeError("Visual validation failed: " + "; ".join(visual_result.issues[:5]))
             correction = await plan_artifact(
                 format_name=artifact.format,
                 model=str(scope.get("model") or settings.gemini_model),

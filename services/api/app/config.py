@@ -34,7 +34,7 @@ class Settings(BaseSettings):
     artifact_max_slides: int = 20
     artifact_max_doc_pages: int = 30
     artifact_max_bytes: int = 50 * 1024 * 1024
-    artifact_qa_retry_count: int = 2
+    artifact_qa_retry_count: int = 1
     artifact_render_timeout_seconds: int = 120
     enhanced_research_documents: bool = True
     artifact_research_max_queries: int = 8

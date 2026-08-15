@@ -7,7 +7,7 @@ import pytest
 
 from app import artifacts as artifacts_module
 from app import research as research_module
-from app.artifacts import ArtifactBlock, ArtifactPage, ArtifactSpec, content_quality_issues, plan_artifact, render_docx, render_pptx
+from app.artifacts import ArtifactBlock, ArtifactPage, ArtifactSpec, VisualQaResult, content_quality_issues, plan_artifact, render_docx, render_pptx, should_retry_visual_qa
 from app.research import ChartSeries, CitationStreamNormalizer, artifact_profile, build_evidence_registry, normalize_citations
 
 
@@ -93,6 +93,14 @@ async def test_deep_research_quality_issues_are_non_fatal_after_one_correction(m
     assert result.quality_issues
     assert result.invalid_citation_count == 1
     assert "[99]" not in result.spec.pages[0].blocks[0].text
+
+
+def test_visual_quality_failure_is_non_fatal_after_retry_budget():
+    failed = VisualQaResult(passed=False, issues=["A table wraps awkwardly"])
+
+    assert should_retry_visual_qa(failed, attempt=0, retry_count=1)
+    assert not should_retry_visual_qa(failed, attempt=1, retry_count=1)
+    assert not should_retry_visual_qa(VisualQaResult(passed=True), attempt=0, retry_count=1)
 
 
 @pytest.mark.asyncio
