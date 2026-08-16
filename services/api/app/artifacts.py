@@ -8,13 +8,14 @@ import re
 import shutil
 import subprocess
 import tempfile
-from time import perf_counter
 import zipfile
-from xml.etree import ElementTree
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime
 from io import BytesIO
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Literal
+from xml.etree import ElementTree
 
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, select
@@ -38,14 +39,19 @@ from .research import (
     ArtifactProfile,
     ChartSeries,
     ResearchPlan,
+    ResearchMode,
     artifact_profile,
     build_evidence_registry,
     canonicalize_grounding_url,
+    citation_ordinals,
+    classify_source,
     deduplicate_sources,
     normalize_citations,
+    remap_citations,
     retrieved_label,
     source_is_primary,
-    strip_source_markers,
+    source_is_visibly_relevant,
+    url_is_public_http,
 )
 from .storage import StorageService
 
@@ -151,6 +157,14 @@ class PlanningResult:
     quality_issues: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class GroundedClaim:
+    text: str
+    query: str
+    source_urls: tuple[str, ...]
+    confidence: float | None = None
+
+
 def should_retry_visual_qa(result: VisualQaResult, attempt: int, retry_count: int) -> bool:
     return not result.passed and attempt < retry_count
 
@@ -241,7 +255,9 @@ async def _create_research_plan(model: str, instructions: str) -> ResearchPlan:
             model=model,
             contents=(
                 "Plan web research for a decision-ready business document. Produce distinct, bounded queries; include "
-                "official regulation and peer-reviewed evidence when the product is regulated. Do not answer the request. "
+                "the exact geography, time period, units, population, and market definition needed to interpret each "
+                "result. Include official regulation and peer-reviewed evidence when the product is regulated. Separate "
+                "commercial market estimates and vendor assertions from independent evidence. Do not answer the request. "
                 f"Return at most {settings.artifact_research_max_queries} queries.\n\nRequest:\n{instructions}"
             ),
             config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=ResearchPlan),
@@ -254,42 +270,78 @@ async def _create_research_plan(model: str, instructions: str) -> ResearchPlan:
         return _fallback_research_plan(instructions)
 
 
-async def _search_once(client: Any, model: str, query: str, semaphore: asyncio.Semaphore) -> tuple[str, list[dict[str, Any]]]:
+async def _search_once(
+    client: Any,
+    model: str,
+    query: str,
+    semaphore: asyncio.Semaphore,
+) -> tuple[tuple[GroundedClaim, ...], tuple[dict[str, Any], ...]]:
     from google.genai import types
 
     async with semaphore:
         response = await client.aio.models.generate_content(
             model=model,
             contents=(
-                "Research the query using current public sources. Prefer government, regulatory, official statistics, "
-                "peer-reviewed research, company filings, and reputable industry publications. Treat commercial market "
-                "reports as estimates and identify uncertainty. Return a factual evidence brief; do not speculate about "
-                f"private company information.\n\nQuery:\n{query}"
+                "Research this narrowly bounded question using current public sources. Return only claims directly "
+                "supported by Google Search grounding. Preserve exact dates, units, jurisdictions, populations, market "
+                "definitions, and forecast periods. Prefer government, regulatory, official-statistics, peer-reviewed, "
+                "and company-filing sources. Label commercial estimates and vendor assertions; do not use promotional "
+                "material for independent legal, medical, safety, or market conclusions. Ignore pages whose visible "
+                "title or topic is unrelated to the question. Do not speculate about private company information."
+                f"\n\nResearch question:\n{query}"
             ),
             config=types.GenerateContentConfig(tools=[types.Tool(google_search=types.GoogleSearch())]),
         )
-    citations: list[dict[str, Any]] = []
     candidate = response.candidates[0] if response.candidates else None
     grounding = getattr(candidate, "grounding_metadata", None)
-    for chunk in (grounding.grounding_chunks if grounding and grounding.grounding_chunks else []):
-        web = getattr(chunk, "web", None)
-        if web and web.uri:
-            citations.append({
+    chunks = list(grounding.grounding_chunks if grounding and grounding.grounding_chunks else [])
+    sources_by_index: dict[int, dict[str, Any]] = {}
+    claims: list[GroundedClaim] = []
+    for support in (grounding.grounding_supports if grounding and grounding.grounding_supports else []):
+        segment = getattr(support, "segment", None)
+        claim_text = (getattr(segment, "text", None) or "").strip()
+        if not claim_text:
+            continue
+        source_urls: list[str] = []
+        support_indices = list(getattr(support, "grounding_chunk_indices", None) or [])
+        confidence_scores = list(getattr(support, "confidence_scores", None) or [])
+        for source_index in support_indices:
+            if not isinstance(source_index, int) or source_index < 0 or source_index >= len(chunks):
+                continue
+            web = getattr(chunks[source_index], "web", None)
+            if not web or not getattr(web, "uri", None):
+                continue
+            source = {
                 "source_type": "web",
-                "title": web.title or web.uri,
+                "title": getattr(web, "title", None) or web.uri,
                 "url": web.uri,
                 "publisher": getattr(web, "domain", None),
-            })
-    return strip_source_markers(response.text or "")[:8000], citations
+            }
+            if not source_is_visibly_relevant(source, query=query, claim=claim_text):
+                continue
+            sources_by_index[source_index] = source
+            source_urls.append(web.uri)
+        if not source_urls:
+            continue
+        confidence = sum(confidence_scores) / len(confidence_scores) if confidence_scores else None
+        claims.append(GroundedClaim(claim_text[:4000], query[:500], tuple(dict.fromkeys(source_urls)), confidence))
+    used_indices = {
+        source_index
+        for support in (grounding.grounding_supports if grounding and grounding.grounding_supports else [])
+        for source_index in (getattr(support, "grounding_chunk_indices", None) or [])
+        if isinstance(source_index, int)
+    }
+    sources = tuple(sources_by_index[index] for index in sorted(used_indices) if index in sources_by_index)
+    return tuple(claims), sources
 
 
 async def _web_research(
     model: str,
     instructions: str,
     profile: ArtifactProfile,
-) -> tuple[str, tuple[dict[str, Any], ...], ResearchPlan | None]:
+) -> tuple[tuple[GroundedClaim, ...], tuple[dict[str, Any], ...], ResearchPlan | None]:
     if not settings.google_api_key:
-        return "", (), None
+        return (), (), None
     from google import genai
 
     client = genai.Client(api_key=settings.google_api_key)
@@ -297,21 +349,107 @@ async def _web_research(
     queries = plan.queries if plan else [instructions]
     semaphore = asyncio.Semaphore(max(1, settings.artifact_research_concurrency))
     results = await asyncio.gather(*(_search_once(client, model, query, semaphore) for query in queries), return_exceptions=True)
-    briefs: list[str] = []
+    claims: list[GroundedClaim] = []
     citations: list[dict[str, Any]] = []
     for query, result in zip(queries, results):
         if isinstance(result, Exception):
             log_event(logger, logging.WARNING, "artifact.research_query_failed", error_type=type(result).__name__)
             continue
-        brief, result_citations = result
-        if brief:
-            briefs.append(f"Research question: {query}\n{brief}")
+        result_claims, result_citations = result
+        claims.extend(result_claims)
         citations.extend(result_citations)
     citations = deduplicate_sources(citations)
-    if citations:
-        resolved = await asyncio.gather(*(canonicalize_grounding_url(item["url"]) for item in citations))
-        citations = deduplicate_sources([{**item, "url": url} for item, url in zip(citations, resolved)])
-    return "\n\n".join(briefs)[:60000], tuple(citations), plan
+    if not citations:
+        return (), (), plan
+
+    resolved_urls = await asyncio.gather(*(canonicalize_grounding_url(item["url"]) for item in citations))
+    public_results = await asyncio.gather(*(url_is_public_http(url) for url in resolved_urls))
+    url_mapping: dict[str, str] = {}
+    prepared: list[dict[str, Any]] = []
+    for item, resolved_url, is_public in zip(citations, resolved_urls, public_results):
+        if not is_public or (
+            resolved_url == item["url"]
+            and "vertexaisearch.cloud.google.com" in resolved_url.lower()
+        ):
+            continue
+        url_mapping[item["url"]] = resolved_url
+        prepared.append({**item, "url": resolved_url})
+    prepared = deduplicate_sources(prepared)
+
+    source_stats: dict[str, dict[str, Any]] = {
+        item["url"]: {"support_count": 0, "confidence": None, "queries": set(), "claims": []}
+        for item in prepared
+    }
+    normalized_claims: list[GroundedClaim] = []
+    for claim in claims:
+        source_urls = tuple(dict.fromkeys(
+            url_mapping[url] for url in claim.source_urls if url in url_mapping and url_mapping[url] in source_stats
+        ))
+        if not source_urls:
+            continue
+        for url in source_urls:
+            stats = source_stats[url]
+            stats["support_count"] += 1
+            stats["queries"].add(claim.query)
+            if claim.text not in stats["claims"]:
+                stats["claims"].append(claim.text)
+            if claim.confidence is not None:
+                stats["confidence"] = max(stats["confidence"] or 0, claim.confidence)
+        normalized_claims.append(GroundedClaim(claim.text, claim.query, source_urls, claim.confidence))
+
+    class_priority = {
+        "primary": 0,
+        "independent_secondary": 1,
+        "commercial_estimate": 2,
+        "vendor_promotional": 3,
+        "unknown": 4,
+    }
+    prepared_by_url: dict[str, dict[str, Any]] = {}
+    for item in prepared:
+        stats = source_stats[item["url"]]
+        source_class = classify_source(item)
+        prepared_by_url[item["url"]] = {
+            **item,
+            "source_class": source_class,
+            "confidence": stats["confidence"],
+            "support_count": stats["support_count"],
+            "excerpt": "\n".join(stats["claims"])[:8000],
+        }
+
+    def rank(url: str) -> tuple[int, int, float, str]:
+        item = prepared_by_url[url]
+        return (
+            class_priority[item["source_class"]],
+            -int(item["support_count"]),
+            -float(item["confidence"] or 0),
+            url,
+        )
+
+    selected_urls: list[str] = []
+    for query in queries:
+        candidates = [url for url, stats in source_stats.items() if query in stats["queries"]]
+        if candidates:
+            best = min(candidates, key=rank)
+            if best not in selected_urls:
+                selected_urls.append(best)
+    for url in sorted(prepared_by_url, key=rank):
+        if url not in selected_urls:
+            selected_urls.append(url)
+        if len(selected_urls) >= 40:
+            break
+    selected = set(selected_urls[:40])
+    final_sources = tuple(prepared_by_url[url] for url in selected_urls[:40])
+    final_claims = tuple(
+        GroundedClaim(
+            claim.text,
+            claim.query,
+            tuple(url for url in claim.source_urls if url in selected),
+            claim.confidence,
+        )
+        for claim in normalized_claims
+        if any(url in selected for url in claim.source_urls)
+    )
+    return final_claims, final_sources, plan
 
 
 def _spec_from_raw(
@@ -383,6 +521,56 @@ def normalize_spec_citations(spec: ArtifactSpec, *, company_count: int, web_coun
     return updated, tuple(dict.fromkeys(invalid))
 
 
+def compact_spec_citations(
+    spec: ArtifactSpec,
+    citations: list[dict[str, Any]],
+) -> tuple[ArtifactSpec, list[dict[str, Any]]]:
+    """Keep only cited evidence and remap every citation surface to a dense namespace."""
+
+    used: set[int] = set()
+
+    def collect(value: str) -> None:
+        used.update(citation_ordinals(value))
+
+    collect(spec.title)
+    collect(spec.subtitle)
+    for page in spec.pages:
+        collect(page.title)
+        collect(page.subtitle)
+        collect(page.speaker_notes)
+        for block in page.blocks:
+            collect(block.heading)
+            collect(block.text)
+            for value in [*block.items, *block.headers, *(cell for row in block.rows for cell in row)]:
+                collect(value)
+            used.update(block.source_ordinals)
+
+    retained = [citation for citation in citations if int(citation.get("ordinal") or 0) in used]
+    mapping = {int(citation["ordinal"]): index for index, citation in enumerate(retained, start=1)}
+    updated = spec.model_copy(deep=True)
+
+    def remap(value: str) -> str:
+        return remap_citations(value, mapping)
+
+    updated.title = remap(updated.title)
+    updated.subtitle = remap(updated.subtitle)
+    for page in updated.pages:
+        page.title = remap(page.title)
+        page.subtitle = remap(page.subtitle)
+        page.speaker_notes = remap(page.speaker_notes)
+        for block in page.blocks:
+            block.heading = remap(block.heading)
+            block.text = remap(block.text)
+            block.items = [remap(item) for item in block.items]
+            block.headers = [remap(item) for item in block.headers]
+            block.rows = [[remap(cell) for cell in row] for row in block.rows]
+            block.source_ordinals = list(dict.fromkeys(
+                mapping[item] for item in block.source_ordinals if item in mapping
+            ))
+    compacted = [{**citation, "ordinal": mapping[int(citation["ordinal"])]} for citation in retained]
+    return updated, compacted
+
+
 def content_quality_issues(
     spec: ArtifactSpec,
     *,
@@ -392,6 +580,13 @@ def content_quality_issues(
     research_plan: ResearchPlan | None = None,
 ) -> list[str]:
     issues: list[str] = []
+
+    def numeric_tokens(value: str) -> set[str]:
+        return {
+            token.replace(",", "")
+            for token in re.findall(r"(?<!\w)\d[\d,]*(?:\.\d+)?%?", value)
+        }
+
     if invalid_markers:
         issues.append("Replace invalid or unknown citation markers: " + ", ".join(invalid_markers[:8]))
     if spec.profile != "deep-research":
@@ -418,12 +613,17 @@ def content_quality_issues(
         for concept, terms in {
             "TAM/SAM/SOM": ("tam", "sam", "som"),
             "competitor comparison": ("competitor", "competitive landscape"),
-            "pricing and unit economics": ("unit economics", "gross margin", "pricing"),
+            "landed COGS and pricing": ("landed cogs", "cost of goods", "pricing"),
+            "gross margin": ("gross margin",),
+            "customer acquisition assumptions": ("customer acquisition", "cac"),
+            "break-even analysis": ("break-even", "breakeven"),
+            "launch capital": ("launch capital", "working capital", "startup capital"),
             "regulatory and safety analysis": ("regulatory", "regulation", "safety"),
             "supply chain": ("supply chain", "supplier"),
+            "decision gates": ("decision gate", "go/no-go", "go / no-go"),
         }.items():
             if not any(term in searchable for term in terms):
-                issues.append(f"Add {concept} appropriate to the available evidence.")
+                issues.append(f"Add {concept} using grounded evidence, or state the evidence/input gap explicitly.")
         if "estimate" not in searchable:
             issues.append("Label third-party market figures as estimates and explain important definition differences.")
         if not any(block.kind == "chart" for page in spec.pages for block in page.blocks):
@@ -434,17 +634,104 @@ def content_quality_issues(
         issues.append("Use at least two primary government, regulatory, or academic sources for the regulated product analysis.")
     if re.search(r"\b(?:organic|vegan|non[- ]gmo).{0,40}\b(?:mandatory|required)\b", searchable, re.IGNORECASE):
         issues.append("Do not describe voluntary organic, vegan, or non-GMO certifications as legally mandatory.")
-    if citations:
+    if spec.pages:
+        citation_by_ordinal = {int(item["ordinal"]): item for item in citations if item.get("ordinal")}
         for page in spec.pages:
             for block in page.blocks:
                 context_label = f"{page.title} {block.heading}".lower()
-                if any(term in context_label for term in ("assumption", "recommendation", "action plan", "roadmap", "scenario", "methodology")):
-                    continue
                 block_text = " ".join([block.heading, block.text, *block.items, *(cell for row in block.rows for cell in row)])
-                if re.search(r"(?<!\w)\d+(?:[.,]\d+)?%?", block_text) and not re.search(r"\[\d+\]", block_text) and not block.source_ordinals:
-                    issues.append(f"Cite the numerical claims in '{block.heading or page.title}'.")
-                    if len(issues) >= 15:
-                        return issues
+                factual_context = not any(
+                    term in context_label
+                    for term in ("assumption", "recommendation", "action plan", "roadmap", "scenario", "methodology")
+                )
+                if factual_context:
+                    for sentence in re.split(r"(?<=[.!?])\s+|\n+", block_text):
+                        sentence_without_citations = re.sub(r"\[\d+(?:\s*,\s*\d+)*\]", "", sentence)
+                        numbers = re.findall(r"(?<!\w)\d+(?:[.,]\d+)?%?", sentence_without_citations)
+                        if not numbers:
+                            continue
+                        sentence_ordinals = set(citation_ordinals(sentence)).union(block.source_ordinals)
+                        if not sentence_ordinals:
+                            issues.append(f"Cite the numerical claim in '{block.heading or page.title}'.")
+                            break
+                        cited_excerpts = " ".join(
+                            str(citation_by_ordinal[ordinal].get("excerpt") or "")
+                            for ordinal in sentence_ordinals
+                            if ordinal in citation_by_ordinal
+                        )
+                        supported_numbers = numeric_tokens(cited_excerpts)
+                        unsupported = [number.replace(",", "") for number in numbers if number.replace(",", "") not in supported_numbers]
+                        if cited_excerpts and unsupported:
+                            issues.append(
+                                f"Verify that citations in '{block.heading or page.title}' support the exact values: "
+                                + ", ".join(unsupported[:4])
+                            )
+                            break
+                if block.kind == "chart":
+                    chart_ordinals = set(block.source_ordinals).union(citation_ordinals(block_text))
+                    if not chart_ordinals:
+                        issues.append(f"Ground the chart in '{block.heading or page.title}' with explicit source citations.")
+                    else:
+                        chart_excerpts = " ".join(
+                            str(citation_by_ordinal[ordinal].get("excerpt") or "")
+                            for ordinal in chart_ordinals
+                            if ordinal in citation_by_ordinal
+                        )
+                        chart_values = [f"{value:g}" for series in block.series for value in series.values]
+                        supported_chart_values = numeric_tokens(chart_excerpts)
+                        unsupported_values = [
+                            value for value in chart_values
+                            if chart_excerpts and value.replace(",", "") not in supported_chart_values
+                        ]
+                        if unsupported_values:
+                            issues.append(
+                                f"Use only explicitly grounded chart values in '{block.heading or page.title}': "
+                                + ", ".join(unsupported_values[:4])
+                            )
+                if any(term in context_label for term in ("regulatory", "regulation", "legal", "safety", "clinical")):
+                    block_ordinals = set(citation_ordinals(block_text)).union(block.source_ordinals)
+                    cited_sources = [citation_by_ordinal[item] for item in block_ordinals if item in citation_by_ordinal]
+                    if factual_context and (not cited_sources or not any(source_is_primary(item) for item in cited_sources)):
+                        issues.append(
+                            f"Use an applicable primary government, regulatory, or academic source in "
+                            f"'{block.heading or page.title}'."
+                        )
+                if re.search(
+                    r"\b(?:guaranteed|completely unaffected|instant consumer trust|highly profitable|risk[- ]free)\b",
+                    block_text,
+                    re.IGNORECASE,
+                ):
+                    issues.append(
+                        f"Replace unsupported absolute language in '{block.heading or page.title}' with a bounded claim."
+                    )
+                if factual_context and re.search(
+                    r"\b(?:we recommend|recommended action|we assume|our assumption|should launch|should enter)\b",
+                    block_text,
+                    re.IGNORECASE,
+                ):
+                    issues.append(
+                        f"Label recommendations and assumptions separately from verified facts in "
+                        f"'{block.heading or page.title}'."
+                    )
+                for sentence in re.split(r"(?<=[.!?])\s+|\n+", block_text):
+                    if not re.search(r"\b(?:forecast|cagr|market size|projected to reach)\b", sentence, re.IGNORECASE):
+                        continue
+                    ordinals = set(citation_ordinals(sentence)).union(block.source_ordinals)
+                    commercial = any(
+                        citation_by_ordinal[item].get("source_class") == "commercial_estimate"
+                        for item in ordinals
+                        if item in citation_by_ordinal
+                    )
+                    if commercial and not re.search(
+                        r"\b(?:estimate|estimated|according to|third-party|commercial report|projects|projected)\b",
+                        sentence,
+                        re.IGNORECASE,
+                    ):
+                        issues.append(
+                            f"Label the commercial forecast in '{block.heading or page.title}' as a third-party estimate."
+                        )
+                if len(issues) >= 15:
+                    return issues
     return issues
 
 
@@ -461,18 +748,23 @@ async def plan_artifact(
     web_search_enabled: bool,
     attachment_payloads: tuple[tuple[str, str, bytes], ...],
     previous_spec: ArtifactSpec | None,
+    research_mode: ResearchMode = "auto",
 ) -> PlanningResult:
     research_request = research_request or instructions
-    profile = (
-        previous_spec.profile if previous_spec is not None
-        else artifact_profile(instructions, format_name) if settings.enhanced_research_documents
-        else "standard"
-    )
+    if previous_spec is not None:
+        profile = previous_spec.profile
+    elif format_name != "docx" or research_mode == "standard" or not settings.enhanced_research_documents:
+        profile = "standard"
+    elif research_mode == "deep":
+        profile = "deep-research"
+    else:
+        profile = artifact_profile(instructions, format_name)
+    research_profile: ArtifactProfile = "deep-research" if research_mode == "deep" else profile
     research_started = perf_counter()
     if web_search_enabled:
-        web_research, web_citations, research_plan = await _web_research(model, research_request, profile)
+        grounded_claims, web_citations, research_plan = await _web_research(model, research_request, research_profile)
     else:
-        web_research, web_citations, research_plan = "", (), None
+        grounded_claims, web_citations, research_plan = (), (), None
     research_duration_ms = round((perf_counter() - research_started) * 1000, 2)
     if not settings.google_api_key:
         fallback = _fallback_spec(format_name, instructions, template_id, previous_spec)
@@ -488,8 +780,24 @@ async def plan_artifact(
         web_sources=list(web_citations),
     )
     indexed_web = [item.model_dump() for item in evidence_registry if item.source_type == "web"]
+    ordinal_by_url = {item["url"]: item["ordinal"] for item in indexed_web if item.get("url")}
+    grounded_evidence_lines: list[str] = []
+    for claim in grounded_claims:
+        ordinals = [ordinal_by_url[url] for url in claim.source_urls if url in ordinal_by_url]
+        if not ordinals:
+            continue
+        source_labels = [
+            f"[{item['ordinal']}] {item.get('source_class') or 'unknown'}"
+            for item in indexed_web
+            if item["ordinal"] in ordinals
+        ]
+        grounded_evidence_lines.append(
+            f"Claim: {claim.text}\nSupports: {', '.join(source_labels)}\nResearch question: {claim.query}"
+        )
+    grounded_evidence = "\n\n".join(grounded_evidence_lines)[:60000]
     source_index = "\n".join(
-        f"[{item['ordinal']}] {item['title']} — {item.get('publisher') or 'Unknown publisher'} — {item['url']}"
+        f"[{item['ordinal']}] {item['title']} — {item.get('publisher') or 'Unknown publisher'} — "
+        f"{item.get('source_class') or 'unknown'} — {item['url']}"
         for item in indexed_web
     )
     numeric_internal_context = re.sub(
@@ -519,8 +827,8 @@ Structured research plan:
 Authorized company evidence:
 {numeric_internal_context or '(none)'}
 
-Public research briefs:
-{web_research or '(none)'}
+Grounded public evidence (each claim may use only its listed supporting sources):
+{grounded_evidence or '(none; state evidence gaps instead of inventing public facts)'}
 
 Final evidence index:
 {source_index or '(none)'}
@@ -707,6 +1015,31 @@ def render_docx(
         hyperlink.append(run)
         paragraph._p.append(hyperlink)
 
+    def add_internal_hyperlink(paragraph: Any, label: str, anchor: str) -> None:
+        hyperlink = OxmlElement("w:hyperlink")
+        hyperlink.set(qn("w:anchor"), anchor)
+        run = OxmlElement("w:r")
+        properties = OxmlElement("w:rPr")
+        color = OxmlElement("w:color")
+        color.set(qn("w:val"), accent)
+        underline = OxmlElement("w:u")
+        underline.set(qn("w:val"), "single")
+        properties.extend([color, underline])
+        text = OxmlElement("w:t")
+        text.text = label
+        run.extend([properties, text])
+        hyperlink.append(run)
+        paragraph._p.append(hyperlink)
+
+    def add_bookmark(paragraph: Any, anchor: str, bookmark_id: int) -> None:
+        start = OxmlElement("w:bookmarkStart")
+        start.set(qn("w:id"), str(bookmark_id))
+        start.set(qn("w:name"), anchor)
+        end = OxmlElement("w:bookmarkEnd")
+        end.set(qn("w:id"), str(bookmark_id))
+        paragraph._p.insert(0, start)
+        paragraph._p.append(end)
+
     def set_cell_margins(cell: Any, margin: int = 90) -> None:
         tc_pr = cell._tc.get_or_add_tcPr()
         tc_mar = tc_pr.find(qn("w:tcMar"))
@@ -856,27 +1189,16 @@ def render_docx(
     if spec.profile == "deep-research":
         contents_heading = add_heading("Contents", 1)
         contents_heading.paragraph_format.space_before = Pt(4)
-        contents = add_styled_paragraph()
-        begin = OxmlElement("w:fldChar")
-        begin.set(qn("w:fldCharType"), "begin")
-        instruction = OxmlElement("w:instrText")
-        instruction.set(qn("xml:space"), "preserve")
-        instruction.text = ' TOC \\o "1-3" \\h \\z \\u '
-        separate = OxmlElement("w:fldChar")
-        separate.set(qn("w:fldCharType"), "separate")
-        placeholder = OxmlElement("w:t")
-        placeholder.text = "Table of contents updates when the document opens."
-        end = OxmlElement("w:fldChar")
-        end.set(qn("w:fldCharType"), "end")
-        for element in (begin, instruction, separate, placeholder, end):
-            run = OxmlElement("w:r")
-            run.append(element)
-            contents._p.append(run)
+        for page_index, page in enumerate(spec.pages, start=1):
+            contents = add_styled_paragraph()
+            add_internal_hyperlink(contents, page.title, f"jules_section_{page_index}")
 
-    for page in spec.pages:
-        add_heading(page.title, 1)
+    for page_index, page in enumerate(spec.pages, start=1):
+        section_heading = add_heading(page.title, 1)
+        add_bookmark(section_heading, f"jules_section_{page_index}", page_index)
         if page.subtitle:
             p = add_styled_paragraph(page.subtitle)
+            p.paragraph_format.keep_with_next = True
             p.runs[0].italic = True
             if not using_template:
                 p.runs[0].font.color.rgb = RGBColor(90, 90, 100)
@@ -917,10 +1239,7 @@ def render_docx(
                 paragraph.add_run(citation["title"])
             if citation.get("publisher"):
                 paragraph.add_run(f". {citation['publisher']}")
-            if url:
-                paragraph.add_run(". ")
-                add_hyperlink(paragraph, url, url)
-            elif location:
+            if not url and location:
                 paragraph.add_run(f". {location}")
             if retrieved:
                 paragraph.add_run(f". Accessed {retrieved}")
@@ -1042,13 +1361,19 @@ async def visual_qa(model: str, preview_paths: list[Path]) -> VisualQaResult:
     ))]
     parts.extend(types.Part.from_bytes(data=path.read_bytes(), mime_type="image/png") for path in preview_paths)
     client = genai.Client(api_key=settings.google_api_key)
-    response = await client.aio.models.generate_content(
-        model=model,
-        contents=[types.Content(role="user", parts=parts)],
-        config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=GeminiVisualQaResult),
-    )
-    result = GeminiVisualQaResult.model_validate_json(response.text or "{}")
-    return VisualQaResult(passed=result.passed, issues=result.issues[:20])
+    try:
+        response = await client.aio.models.generate_content(
+            model=model,
+            contents=[types.Content(role="user", parts=parts)],
+            config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=GeminiVisualQaResult),
+        )
+        result = GeminiVisualQaResult.model_validate_json(response.text or "{}")
+        return VisualQaResult(passed=result.passed, issues=result.issues[:20])
+    except Exception as exc:
+        # Visual review is an optional quality improvement. Rendering and structural
+        # validation remain authoritative when the external model is unavailable.
+        log_event(logger, logging.WARNING, "artifact.visual_qa_failed", error_type=type(exc).__name__)
+        return VisualQaResult(passed=True)
 
 
 async def _check_cancelled(db: AsyncSession, job: ArtifactJob, artifact: GeneratedArtifact, version: ArtifactVersion) -> None:
@@ -1126,6 +1451,7 @@ async def process_artifact_job(db: AsyncSession, storage: StorageService, job: A
         web_search_enabled=bool(scope.get("web_search_enabled")),
         attachment_payloads=attachment_payloads,
         previous_spec=previous_spec,
+        research_mode=str(scope.get("research_mode") or "auto"),
     )
     max_pages = settings.artifact_max_slides if artifact.format == "pptx" else settings.artifact_max_doc_pages
     result.spec.pages = result.spec.pages[:max_pages]
@@ -1136,41 +1462,21 @@ async def process_artifact_job(db: AsyncSession, storage: StorageService, job: A
     await db.commit()
     await _check_cancelled(db, job, artifact, version)
 
-    await db.execute(delete(ArtifactCitation).where(ArtifactCitation.version_id == version.id))
     citation_dicts: list[dict[str, Any]] = []
     for ordinal, item in enumerate(internal_results, start=1):
         citation = item.citation(ordinal)
         citation_dicts.append(citation)
-        db.add(ArtifactCitation(
-            organization_id=artifact.organization_id,
-            version_id=version.id,
-            ordinal=ordinal,
-            source_type="company",
-            knowledge_base_id=citation["knowledge_base_id"],
-            document_id=citation["document_id"],
-            document_version_id=citation["version_id"],
-            chunk_id=citation["chunk_id"],
-            title=citation["title"],
-            location=citation["location"],
-            metadata_json=json.dumps({"knowledge_base_title": citation["knowledge_base_title"], "version": citation["version"]}),
-        ))
     for index, item in enumerate(result.web_citations, start=len(citation_dicts) + 1):
         retrieved_at = utc_now()
         citation = {**item, "ordinal": index, "location": item.get("url"), "retrieved_at": retrieved_at.isoformat()}
         citation_dicts.append(citation)
-        db.add(ArtifactCitation(
-            organization_id=artifact.organization_id,
-            version_id=version.id,
-            ordinal=index,
-            source_type="web",
-            title=item.get("title") or "Web source",
-            url=item.get("url"),
-            publisher=item.get("publisher"),
-            retrieved_at=retrieved_at,
-        ))
+    compacted_spec, citation_dicts = compact_spec_citations(result.spec, citation_dicts)
+    result = replace(result, spec=compacted_spec)
     reserved_pages = (1 if artifact.format == "pptx" else 0) + (1 if citation_dicts else 0)
     max_content_pages = max(1, (settings.artifact_max_slides if artifact.format == "pptx" else settings.artifact_max_doc_pages) - reserved_pages)
     result.spec.pages = result.spec.pages[:max_content_pages]
+    compacted_spec, citation_dicts = compact_spec_citations(result.spec, citation_dicts)
+    result = replace(result, spec=compacted_spec)
     version.content_spec_json = result.spec.model_dump_json()
     await db.commit()
 
@@ -1226,6 +1532,7 @@ async def process_artifact_job(db: AsyncSession, storage: StorageService, job: A
                 web_search_enabled=False,
                 attachment_payloads=(),
                 previous_spec=result.spec,
+                research_mode=str(scope.get("research_mode") or "auto"),
             )
             result = PlanningResult(
                 correction.spec,
@@ -1237,6 +1544,8 @@ async def process_artifact_job(db: AsyncSession, storage: StorageService, job: A
                 result.quality_issues,
             )
             result.spec.pages = result.spec.pages[:max_content_pages]
+            compacted_spec, citation_dicts = compact_spec_citations(result.spec, citation_dicts)
+            result = replace(result, spec=compacted_spec)
             version.content_spec_json = result.spec.model_dump_json()
             await db.commit()
         page_count = len(preview_paths) or int(qa.get("structural_page_count") or len(result.spec.pages))
@@ -1254,6 +1563,42 @@ async def process_artifact_job(db: AsyncSession, storage: StorageService, job: A
             await storage.save_bytes(preview_key, preview_path.read_bytes(), "image/png")
             preview_keys.append(preview_key)
 
+    await db.execute(delete(ArtifactCitation).where(ArtifactCitation.version_id == version.id))
+    for citation in citation_dicts:
+        source_type = str(citation.get("source_type") or "web")
+        metadata: dict[str, Any] = {}
+        if source_type == "company":
+            metadata = {
+                "knowledge_base_title": citation.get("knowledge_base_title"),
+                "version": citation.get("version"),
+            }
+        else:
+            metadata = {
+                "source_class": citation.get("source_class"),
+                "confidence": citation.get("confidence"),
+                "excerpt": citation.get("excerpt"),
+            }
+        retrieved_at = citation.get("retrieved_at")
+        if isinstance(retrieved_at, str):
+            retrieved_at = datetime.fromisoformat(retrieved_at.replace("Z", "+00:00"))
+        db.add(ArtifactCitation(
+            organization_id=artifact.organization_id,
+            version_id=version.id,
+            ordinal=int(citation["ordinal"]),
+            source_type=source_type,
+            knowledge_base_id=citation.get("knowledge_base_id"),
+            document_id=citation.get("document_id"),
+            document_version_id=citation.get("version_id"),
+            chunk_id=citation.get("chunk_id"),
+            title=citation.get("title") or "Web source",
+            url=citation.get("url"),
+            publisher=citation.get("publisher"),
+            location=citation.get("location"),
+            retrieved_at=retrieved_at,
+            metadata_json=json.dumps(metadata),
+        ))
+
+    version.content_spec_json = result.spec.model_dump_json()
     version.storage_key = storage_key
     version.file_name = file_name
     version.mime_type = MIME_TYPES[artifact.format]

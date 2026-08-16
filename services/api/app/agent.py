@@ -45,6 +45,7 @@ class AgentRequest:
     internal_context: str = ""
     internal_citation_count: int = 0
     web_search_enabled: bool = False
+    research_mode: str = "auto"
 
 
 @dataclass(frozen=True)
@@ -71,7 +72,8 @@ class DemoChatProvider(ChatProvider):
             "1. **Clarify the decision.** State the outcome, owner, and time horizon before adding detail.\n"
             "2. **Prioritize the evidence.** Lead with the few facts that materially change the decision.\n"
             "3. **Make the next move explicit.** End with an accountable action and a measurable checkpoint.\n\n"
-            f"This response used **{request.effort}** effort with the **{'Pro' if request.model == PRO_MODEL_ID else 'Default'}** model.{attachment_note}"
+            f"This response used **{request.effort}** effort with the **{'Pro' if request.model == PRO_MODEL_ID else 'Default'}** model"
+            f"{' in deep-research mode' if request.research_mode == 'deep' else ''}.{attachment_note}"
         )
         for token in response.split(" "):
             await asyncio.sleep(0.018)
@@ -131,7 +133,15 @@ class GoogleAdkChatProvider(ChatProvider):
             research_response = await research_client.aio.models.generate_content(
                 model=self.model_id,
                 contents=(
-                    "Research this user-authored question using public web sources. Do not speculate about private company "
+                    (
+                        "Conduct broad, decision-ready research for this user-authored question. Search across distinct "
+                        "aspects of the request, reconcile material disagreements, preserve dates, units, geography, and "
+                        "definitions, and identify evidence gaps. Prefer primary sources for regulatory, medical, and legal "
+                        "claims. "
+                        if request.research_mode == "deep"
+                        else "Research this user-authored question using current public web sources. "
+                    )
+                    + "Do not speculate about private company "
                     f"information. Return a factual research brief with source attribution.\n\nQuestion:\n{request.message}"
                 ),
                 config=types.GenerateContentConfig(tools=[types.Tool(google_search=types.GoogleSearch())]),
@@ -164,6 +174,8 @@ class GoogleAdkChatProvider(ChatProvider):
 
         prompt = (
             f"User custom instructions:\n{request.custom_instructions or '(none)'}\n\n"
+            f"Research mode: {request.research_mode}. "
+            f"{'Produce a comprehensive, evidence-led answer with explicit limitations.' if request.research_mode == 'deep' else 'Keep research proportional to the request.'}\n\n"
             f"Reasoning guidance: {EFFORT_GUIDANCE.get(request.effort, EFFORT_GUIDANCE['medium'])}\n\n"
             f"Conversation context:\n{request.history or '(none)'}\n\n"
             f"Private memory belonging only to this user:\n{request.private_memory or '(none)'}\n\n"

@@ -1,6 +1,7 @@
 export type View = "chat" | "knowledge" | "review" | "prompts" | "settings" | "organization"
 export type Role = "owner" | "admin" | "member"
 export type Effort = "low" | "medium" | "high"
+export type ResearchMode = "auto" | "standard" | "deep"
 export interface Organization { id: string; name: string; slug: string; role: Role }
 export type OrganizationMembership = Organization
 export interface AuthUser { id: string; display_name: string; email: string; avatar_url?: string | null }

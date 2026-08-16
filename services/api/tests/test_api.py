@@ -356,6 +356,26 @@ def test_web_default_and_ambiguous_company_question_emit_explainable_state():
         assert "Which team, region, time period" in body
 
 
+def test_deep_research_mode_is_available_without_an_artifact_and_requires_web_search():
+    with TestClient(app) as client:
+        conversation = client.post("/v1/conversations", headers=OWNER, json={
+            "title": "Deep research chat",
+            "knowledge_base_ids": [],
+            "web_search_enabled": False,
+        }).json()
+        with client.stream("POST", f"/v1/conversations/{conversation['id']}/messages/stream", headers=OWNER, json={
+            "content": "Evaluate this market opportunity",
+            "knowledge_base_ids": [],
+            "web_search_enabled": False,
+            "research_mode": "deep",
+        }) as response:
+            body = "".join(response.iter_text())
+
+        assert response.status_code == 200
+        assert "event: message_completed" in body
+        assert client.get(f"/v1/conversations/{conversation['id']}", headers=OWNER).json()["web_search_enabled"] is True
+
+
 def _sse_payload(body: str, event_name: str) -> dict:
     for block in body.split("\n\n"):
         if f"event: {event_name}" not in block:

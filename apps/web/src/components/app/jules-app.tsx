@@ -10,6 +10,7 @@ import { KnowledgeView } from "@/components/app/knowledge-view"
 import { OrganizationView } from "@/components/app/organization-view"
 import { OrganizationAccessDialog } from "@/components/organizations/organization-access-dialog"
 import { PromptLibrary } from "@/components/app/prompt-library"
+import { PromptPickerDialog } from "@/components/app/prompt-picker-dialog"
 import { SettingsView } from "@/components/app/settings-view"
 import { reconcileConversationMessages } from "@/lib/conversation-state"
 import { julesApi } from "@/lib/api"
@@ -52,9 +53,11 @@ export function JulesApp(props: JulesAppProps = {}) {
   const [effort, setEffort] = useState<Effort>(demoConversations[0].effort)
   const [selectedKnowledgeBaseIds, setSelectedKnowledgeBaseIds] = useState(demoConversations[0].knowledge_base_ids)
   const [webSearchEnabled, setWebSearchEnabled] = useState(demoConversations[0].web_search_enabled)
+  const [deepResearchEnabled, setDeepResearchEnabled] = useState(false)
   const [pendingFiles, setPendingFiles] = useState<Array<{ attachment: Attachment; file: File }>>([])
   const [streaming, setStreaming] = useState(false)
   const [artifactRequest, setArtifactRequest] = useState<ArtifactRequest | undefined>()
+  const [promptPickerOpen, setPromptPickerOpen] = useState(false)
   const backendConnected = useRef(false)
   const streamController = useRef<AbortController | null>(null)
   const preserveFailedConversation = useRef<string | null>(null)
@@ -229,10 +232,14 @@ export function JulesApp(props: JulesAppProps = {}) {
       } catch { toast.error("The new conversation is available locally only.") }
     }
     const conversationId = conversation.id
-    const userMessage: Message = { id: crypto.randomUUID(), role: "user", content, status: "completed", created_at: new Date().toISOString(), attachments, knowledge_base_ids: activeKnowledgeBaseIds, web_search_enabled: webSearchEnabled }
     const requestedArtifact = artifactRequest
+    const requestedDeepResearch = deepResearchEnabled
+    const effectiveWebSearch = requestedDeepResearch || webSearchEnabled
+    const userMessage: Message = { id: crypto.randomUUID(), role: "user", content, status: "completed", created_at: new Date().toISOString(), attachments, knowledge_base_ids: activeKnowledgeBaseIds, web_search_enabled: effectiveWebSearch }
     let assistantId = crypto.randomUUID()
-    const activity = requestedArtifact
+    const activity = requestedDeepResearch
+      ? `Conducting deep research${requestedArtifact ? ` for your ${requestedArtifact.format === "pptx" ? "presentation" : "document"}` : ""}`
+      : requestedArtifact
       ? `Thinking through your ${requestedArtifact.format === "pptx" ? "presentation" : "document"}`
       : activeKnowledgeBaseIds.length && webSearchEnabled
         ? "Thinking with company and web sources"
@@ -241,19 +248,19 @@ export function JulesApp(props: JulesAppProps = {}) {
           : webSearchEnabled
             ? "Thinking and researching the web"
             : "Thinking"
-    const assistantMessage: Message = { id: assistantId, role: "assistant", content: "", status: "streaming", created_at: new Date().toISOString(), knowledge_base_ids: activeKnowledgeBaseIds, web_search_enabled: webSearchEnabled, activity }
+    const assistantMessage: Message = { id: assistantId, role: "assistant", content: "", status: "streaming", created_at: new Date().toISOString(), knowledge_base_ids: activeKnowledgeBaseIds, web_search_enabled: effectiveWebSearch, activity }
     setMessages((current) => ({ ...current, [conversationId]: [...(current[conversationId] ?? []), userMessage, assistantMessage] }))
     if (conversation.title === "New conversation") setConversations((current) => current.map((item) => item.id === conversationId ? { ...item, title: content.split("\n")[0].slice(0, 60) } : item))
-    setDraft(""); setPendingFiles([]); setArtifactRequest(undefined); setStreaming(true)
+    setDraft(""); setPendingFiles([]); setArtifactRequest(undefined); setDeepResearchEnabled(false); setStreaming(true)
     const controller = new AbortController(); streamController.current = controller
     try {
       if (!backendConnected.current || conversationId.startsWith("local")) await simulateResponse(conversationId, assistantId)
-      else await julesApi.streamMessage(activeOrganizationId, conversationId, { content, model, effort, attachment_ids: attachments.map((item) => item.id), knowledge_base_ids: activeKnowledgeBaseIds, web_search_enabled: webSearchEnabled, artifact_request: requestedArtifact }, ({ event, data }) => {
+      else await julesApi.streamMessage(activeOrganizationId, conversationId, { content, model, effort, attachment_ids: attachments.map((item) => item.id), knowledge_base_ids: activeKnowledgeBaseIds, web_search_enabled: effectiveWebSearch, research_mode: requestedDeepResearch ? "deep" : "standard", artifact_request: requestedArtifact }, ({ event, data }) => {
         if (event === "message_started" && typeof data.message_id === "string") {
           const previousId = assistantId; assistantId = data.message_id
           setMessages((current) => ({ ...current, [conversationId]: (current[conversationId] ?? []).map((item) => item.id === previousId ? { ...item, id: assistantId } : item) }))
         } else if (event === "retrieval_started") {
-          setMessages((current) => ({ ...current, [conversationId]: (current[conversationId] ?? []).map((item) => item.id === assistantId ? { ...item, activity: item.knowledge_base_ids?.length ? "Thinking through company knowledge" : item.web_search_enabled ? "Thinking and researching the web" : "Thinking" } : item) }))
+          setMessages((current) => ({ ...current, [conversationId]: (current[conversationId] ?? []).map((item) => item.id === assistantId ? { ...item, activity: requestedDeepResearch ? activity : item.knowledge_base_ids?.length ? "Thinking through company knowledge" : item.web_search_enabled ? "Thinking and researching the web" : "Thinking" } : item) }))
         } else if (event === "text_delta" && typeof data.text === "string") {
           setMessages((current) => ({ ...current, [conversationId]: (current[conversationId] ?? []).map((item) => item.id === assistantId ? { ...item, content: item.content + data.text } : item) }))
         } else if (event === "clarification_required" && typeof data.question === "string") {
@@ -268,7 +275,7 @@ export function JulesApp(props: JulesAppProps = {}) {
           setMessages((current) => ({ ...current, [conversationId]: (current[conversationId] ?? []).map((item) => item.id === assistantId ? { ...item, artifacts: [...(item.artifacts ?? []), artifact] } : item) }))
         }
       }, controller.signal)
-      setConversations((current) => current.map((item) => item.id === conversationId ? { ...item, knowledge_base_ids: activeKnowledgeBaseIds, web_search_enabled: webSearchEnabled } : item))
+      setConversations((current) => current.map((item) => item.id === conversationId ? { ...item, knowledge_base_ids: activeKnowledgeBaseIds, web_search_enabled: effectiveWebSearch } : item))
       setMessages((current) => ({ ...current, [conversationId]: (current[conversationId] ?? []).map((item) => item.id === assistantId ? { ...item, status: "completed" } : item) }))
     } catch (error) {
       if ((error as Error).name !== "AbortError") {
@@ -363,9 +370,15 @@ export function JulesApp(props: JulesAppProps = {}) {
   }
 
   function changeWebSearch(enabled: boolean) {
+    if (!enabled) setDeepResearchEnabled(false)
     setWebSearchEnabled(enabled)
     setConversations((current) => current.map((item) => item.id === activeConversation.id ? { ...item, web_search_enabled: enabled } : item))
     if (backendConnected.current && !activeConversation.id.startsWith("local")) julesApi.updateConversation(activeOrganizationId, activeConversation.id, { web_search_enabled: enabled }).catch(() => toast.error("Web-search choice was saved locally only."))
+  }
+
+  function changeDeepResearch(enabled: boolean) {
+    setDeepResearchEnabled(enabled)
+    if (enabled && !webSearchEnabled) changeWebSearch(true)
   }
 
   async function createKnowledgeBase(title: string, description: string) {
@@ -484,7 +497,7 @@ export function JulesApp(props: JulesAppProps = {}) {
   function switchOrganization(id: string) {
     if (id === activeOrganizationId) return
     streamController.current?.abort()
-    setConversations([]); setMessages({}); setPrompts([]); setMembers([]); setInvitations([]); setAuditEvents([]); setKnowledgeBases([]); setActiveKnowledgeBase(undefined); setActiveKnowledgeBaseId(""); setActiveConversationId(""); setPendingFiles([]); setKnowledgeReview(demoKnowledgeReview); setArtifactRequest(undefined)
+    setConversations([]); setMessages({}); setPrompts([]); setMembers([]); setInvitations([]); setAuditEvents([]); setKnowledgeBases([]); setActiveKnowledgeBase(undefined); setActiveKnowledgeBaseId(""); setActiveConversationId(""); setPendingFiles([]); setKnowledgeReview(demoKnowledgeReview); setArtifactRequest(undefined); setDeepResearchEnabled(false); setPromptPickerOpen(false)
     setActiveOrganizationId(id); setActiveView("chat"); setMobileNavigationOpen(false)
     props.onOrganizationChange?.(id)
   }
@@ -513,12 +526,13 @@ export function JulesApp(props: JulesAppProps = {}) {
   return <main className="flex h-dvh min-h-0 w-full overflow-hidden bg-background">
     <div className="hidden h-full w-[272px] shrink-0 border-r lg:block">{sidebar}</div>
     <Sheet open={mobileNavigationOpen} onOpenChange={setMobileNavigationOpen}><SheetContent side="left" className="w-[min(86vw,340px)] p-0" showCloseButton={false}><SheetHeader className="sr-only"><SheetTitle>Jules AI navigation</SheetTitle><SheetDescription>Choose an organization, conversation, or settings page.</SheetDescription></SheetHeader>{sidebar}</SheetContent></Sheet>
-    {visibleView === "chat" ? <ChatView organizationId={activeOrganizationId} conversation={activeConversation} messages={activeMessages} models={models} knowledgeBases={knowledgeBases} selectedKnowledgeBaseIds={activeKnowledgeBaseIds} webSearchEnabled={webSearchEnabled} artifactRequest={artifactRequest} draft={draft} effort={effort} model={model} pendingAttachments={pendingFiles.map((item) => item.attachment)} streaming={streaming} onDraftChange={setDraft} onEffortChange={setEffort} onModelChange={setModel} onKnowledgeBaseIdsChange={changeKnowledgeScope} onWebSearchChange={changeWebSearch} onArtifactRequestChange={setArtifactRequest} onArtifactUpdated={artifactUpdated} onArtifactDeleted={removeArtifactFromMessages} onSend={() => void sendMessage()} onStop={stopStreaming} onOpenPrompts={() => setActiveView("prompts")} onFileSelect={(file) => void addFile(file)} onRemoveAttachment={(id) => setPendingFiles((current) => current.filter((item) => item.attachment.id !== id))} onOpenMobileNavigation={() => setMobileNavigationOpen(true)} onRegenerate={regenerate} onSaveKnowledge={(message, knowledgeBaseId, title) => void saveMessageToKnowledge(message, knowledgeBaseId, title)} onReportAnswer={(message) => void reportAnswer(message)} /> : null}
+    {visibleView === "chat" ? <ChatView organizationId={activeOrganizationId} conversation={activeConversation} messages={activeMessages} models={models} knowledgeBases={knowledgeBases} selectedKnowledgeBaseIds={activeKnowledgeBaseIds} webSearchEnabled={webSearchEnabled} deepResearchEnabled={deepResearchEnabled} artifactRequest={artifactRequest} draft={draft} effort={effort} model={model} pendingAttachments={pendingFiles.map((item) => item.attachment)} streaming={streaming} onDraftChange={setDraft} onEffortChange={setEffort} onModelChange={setModel} onKnowledgeBaseIdsChange={changeKnowledgeScope} onWebSearchChange={changeWebSearch} onDeepResearchChange={changeDeepResearch} onArtifactRequestChange={setArtifactRequest} onArtifactUpdated={artifactUpdated} onArtifactDeleted={removeArtifactFromMessages} onSend={() => void sendMessage()} onStop={stopStreaming} onOpenPrompts={() => setPromptPickerOpen(true)} onFileSelect={(file) => void addFile(file)} onRemoveAttachment={(id) => setPendingFiles((current) => current.filter((item) => item.attachment.id !== id))} onOpenMobileNavigation={() => setMobileNavigationOpen(true)} onRegenerate={regenerate} onSaveKnowledge={(message, knowledgeBaseId, title) => void saveMessageToKnowledge(message, knowledgeBaseId, title)} onReportAnswer={(message) => void reportAnswer(message)} /> : null}
     {visibleView === "knowledge" ? <KnowledgeView knowledgeBases={knowledgeBases} activeKnowledgeBase={activeKnowledgeBase} members={members} role={activeRole} onSelect={setActiveKnowledgeBaseId} onCreate={(title, description) => void createKnowledgeBase(title, description)} onUpdate={(knowledgeBaseId, title, description) => void updateKnowledgeBaseDetails(knowledgeBaseId, title, description)} onUpload={(knowledgeBaseId, files) => void uploadKnowledge(knowledgeBaseId, files)} onUpdateAccess={(knowledgeBaseId, userIds, reason) => void updateKnowledgeAccess(knowledgeBaseId, userIds, reason)} onArchive={(knowledgeBaseId) => void archiveKnowledgeBase(knowledgeBaseId)} onOpenMobileNavigation={() => setMobileNavigationOpen(true)} /> : null}
     {visibleView === "review" && canReviewKnowledge ? <KnowledgeReviewView review={knowledgeReview} onResolveConflict={(id, action) => void resolveConflict(id, action)} onReviewProposal={(id, decision) => void reviewProposal(id, decision)} onOpenMobileNavigation={() => setMobileNavigationOpen(true)} /> : null}
     {visibleView === "prompts" ? <PromptLibrary prompts={prompts} role={activeRole} onUsePrompt={(body) => { if (draft.trim() && !window.confirm("Replace the text already in the composer?")) return; setDraft(body); setActiveView("chat") }} onFavorite={(id) => void toggleFavorite(id)} onSave={(value, id) => void savePrompt(value, id)} onLoadVersions={loadPromptVersions} onRestoreVersion={restorePromptVersion} onOpenMobileNavigation={() => setMobileNavigationOpen(true)} /> : null}
     {visibleView === "settings" ? <SettingsView key={`${activeOrganizationId}-${settings.theme}-${settings.default_model}-${settings.default_effort}-${settings.custom_instructions}-${settings.web_search_default}`} settings={settings} documentTemplate={documentTemplate} models={models} organizations={organizations} activeOrganizationId={activeOrganizationId} onOrganizationChange={switchOrganization} onManageOrganizations={() => setOrganizationDialogOpen(true)} onLeaveOrganization={(id) => void leaveOrganization(id)} onSave={(next) => void saveSettings(next)} onUploadDocumentTemplate={(file) => void uploadDocumentTemplate(file)} onActivateDocumentTemplate={(versionId) => void activateDocumentTemplate(versionId)} onDisableDocumentTemplate={() => void disableDocumentTemplate()} onDownloadDocumentTemplate={(version) => void downloadDocumentTemplate(version)} onDeleteAllConversations={() => void deleteAllConversations()} onDeleteAccount={() => void deleteAccount()} onOpenMobileNavigation={() => setMobileNavigationOpen(true)} /> : null}
     {visibleView === "organization" ? <OrganizationView organizationName={organizations.find((item) => item.id === activeOrganizationId)?.name ?? "Organization"} members={members} invitations={invitations} auditEvents={auditEvents} models={models} onInvite={invite} onSavePolicy={(defaultModel, maximumEffort) => void saveModelPolicy(defaultModel, maximumEffort)} onResendInvitation={resendInvitation} onRevokeInvitation={(id) => void revokeInvitation(id)} onOpenMobileNavigation={() => setMobileNavigationOpen(true)} /> : null}
+    <PromptPickerDialog open={promptPickerOpen} prompts={prompts} onOpenChange={setPromptPickerOpen} onFavorite={(id) => void toggleFavorite(id)} onUsePrompt={(body) => { if (draft.trim() && !window.confirm("Replace the text already in the composer?")) return false; setDraft(body); return true }} onManagePrompts={() => setActiveView("prompts")} />
     <OrganizationAccessDialog open={organizationDialogOpen} onOpenChange={setOrganizationDialogOpen} onOrganizationReady={organizationReady} />
   </main>
 }

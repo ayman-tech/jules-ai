@@ -1,4 +1,4 @@
-import type { Artifact, ArtifactRequest, AuditEvent, AuthBootstrap, Conversation, Invitation, InvitationPreview, KnowledgeBase, KnowledgeReview, Member, Message, ModelOption, Organization, OrganizationDocumentTemplate, Prompt, PromptVersion, StreamEvent, UserProfile, UserSettings } from "@/lib/types"
+import type { Artifact, ArtifactRequest, AuditEvent, AuthBootstrap, Conversation, Invitation, InvitationPreview, KnowledgeBase, KnowledgeReview, Member, Message, ModelOption, Organization, OrganizationDocumentTemplate, Prompt, PromptVersion, ResearchMode, StreamEvent, UserProfile, UserSettings } from "@/lib/types"
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000/v1"
 export const AUTH_MODE = process.env.NEXT_PUBLIC_AUTH_MODE ?? "development"
@@ -129,7 +129,7 @@ export const julesApi = {
     if (!response.ok) { const error = await response.json().catch(() => ({ detail: "Upload failed" })); throw new Error(error.detail ?? "Upload failed") }
     return response.json()
   },
-  async streamMessage(organizationId: string, conversationId: string, body: { content: string; model: string; effort: string; attachment_ids: string[]; knowledge_base_ids: string[]; web_search_enabled: boolean; artifact_request?: ArtifactRequest }, onEvent: (event: StreamEvent) => void, signal: AbortSignal) {
+  async streamMessage(organizationId: string, conversationId: string, body: { content: string; model: string; effort: string; attachment_ids: string[]; knowledge_base_ids: string[]; web_search_enabled: boolean; research_mode?: ResearchMode; artifact_request?: ArtifactRequest }, onEvent: (event: StreamEvent) => void, signal: AbortSignal) {
     const response = await fetch(`${API_URL}/conversations/${conversationId}/messages/stream`, { method: "POST", headers: await headers(organizationId), body: JSON.stringify(body), signal })
     if (!response.ok || !response.body) throw new Error("Unable to stream response")
     const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = ""

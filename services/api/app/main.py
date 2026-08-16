@@ -208,6 +208,7 @@ class MessageCreate(BaseModel):
     attachment_ids: list[str] = Field(default_factory=list, max_length=20)
     knowledge_base_ids: list[str] | None = Field(default=None, max_length=100)
     web_search_enabled: bool | None = None
+    research_mode: Literal["auto", "standard", "deep"] = "auto"
     artifact_request: ArtifactRequest | None = None
 
 
@@ -543,6 +544,7 @@ async def queue_artifact(
     effort: str,
     knowledge_base_ids: list[str],
     web_search_enabled: bool,
+    research_mode: Literal["auto", "standard", "deep"],
     attachment_ids: list[str],
 ) -> GeneratedArtifact:
     if not settings.artifact_generation_enabled:
@@ -550,6 +552,7 @@ async def queue_artifact(
     scope = {
         "knowledge_base_ids": knowledge_base_ids,
         "web_search_enabled": web_search_enabled,
+        "research_mode": research_mode,
         "attachment_ids": attachment_ids,
         "model": model,
         "effort": effort,
@@ -1727,6 +1730,8 @@ async def stream_message(conversation_id: str, payload: MessageCreate, context: 
     if payload.knowledge_base_ids is not None and len(set(knowledge_base_ids)) != len(set(requested_knowledge_ids)):
         raise HTTPException(status_code=403, detail="One or more knowledge sources are unavailable")
     web_search_enabled = payload.web_search_enabled if payload.web_search_enabled is not None else conversation.web_search_enabled
+    if payload.research_mode == "deep":
+        web_search_enabled = True
     conversation.knowledge_base_ids_json = json.dumps(knowledge_base_ids)
     conversation.web_search_enabled = web_search_enabled
     attachment_payloads: tuple[AttachmentPayload, ...] = ()
@@ -1822,6 +1827,7 @@ async def stream_message(conversation_id: str, payload: MessageCreate, context: 
         internal_context=internal_context if knowledge_base_ids else "",
         internal_citation_count=len(internal_citations),
         web_search_enabled=web_search_enabled,
+        research_mode=payload.research_mode,
     )
 
     async def events():
@@ -1843,6 +1849,7 @@ async def stream_message(conversation_id: str, payload: MessageCreate, context: 
             "attachments": attachment_metadata,
             "knowledge_base_ids": knowledge_base_ids,
             "web_search_enabled": web_search_enabled,
+            "research_mode": payload.research_mode,
         }
         log_event(
             logger,
@@ -1882,7 +1889,8 @@ async def stream_message(conversation_id: str, payload: MessageCreate, context: 
                 log_transcript(**common_transcript_fields, outcome="completed", assistant_response=response, duration_ms=round((perf_counter() - stream_started) * 1000, 2))
                 return
             if artifact_format and not clarification:
-                response = f"I’m creating an editable {'Word document' if artifact_format == 'docx' else 'PowerPoint presentation'}. You can follow its progress and download it from the file card below."
+                research_prefix = "I’m conducting deep research and creating" if payload.research_mode == "deep" else "I’m creating"
+                response = f"{research_prefix} an editable {'Word document' if artifact_format == 'docx' else 'PowerPoint presentation'}. You can follow its progress and download it from the file card below."
                 async with SessionLocal() as stream_db:
                     stream_db.add(Message(
                         id=assistant_message_id,
@@ -1909,6 +1917,7 @@ async def stream_message(conversation_id: str, payload: MessageCreate, context: 
                         effort=effort,
                         knowledge_base_ids=knowledge_base_ids,
                         web_search_enabled=web_search_enabled,
+                        research_mode=payload.research_mode,
                         attachment_ids=payload.attachment_ids,
                     )
                     queued_json = await artifact_json(stream_db, queued)
