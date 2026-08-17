@@ -14,8 +14,8 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Jules AI — Company Second Brain",
-  description: "Permission-aware company knowledge and live research in one AI workspace.",
+  title: "Jules AI",
+  description: "Private AI workspace and second brain for your organization.",
 };
 
 export default function RootLayout({
